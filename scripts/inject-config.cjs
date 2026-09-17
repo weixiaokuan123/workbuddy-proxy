@@ -33,7 +33,11 @@ const strip = (s) => {
   return out
 }
 
-const cfg = JSON.parse(strip(raw))
+// 剥掉 UTF-8 BOM：opencode.jsonc 常由 PowerShell/编辑器以带 BOM 方式保存，
+// JSON.parse 不能容忍 BOM，否则报 "Unexpected token '﻿'"。
+const hadBom = raw.charCodeAt(0) === 0xFEFF
+const body = hadBom ? raw.slice(1) : raw
+const cfg = JSON.parse(strip(body))
 cfg.provider = cfg.provider || {}
 
 const limit = (context, output) => ({ context, output })
@@ -80,5 +84,7 @@ cfg.provider['workbuddy-global'] = {
 }
 
 fs.copyFileSync(cfgPath, cfgPath + '.bak.workbuddy')
-fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+// 保持原有的 BOM 状态，避免改变 opencode 对该文件的读取行为。
+const out = JSON.stringify(cfg, null, 2) + '\n'
+fs.writeFileSync(cfgPath, (hadBom ? '\uFEFF' : '') + out, 'utf8')
 console.log('providers injected; backup at opencode.jsonc.bak.workbuddy')
