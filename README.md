@@ -9,14 +9,45 @@
 
 一个进程同时服务两个区域，每个区域用独立的持久 `bearer key` 做本地鉴权。
 
+> **两点须知**
+> 1. 本项目**参考 [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) 改写**，只保留其纯 Node 连接内核。
+> 2. 本代理**不能切换账号**，只使用当前登录的账号；如需切换请配合
+>    **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**。详见「不支持切换账号」一节。
+
 ## 来源
 
-本项目改自 [dingminhua/dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy)
-（MIT，Copyright (c) 2026 LaoDing），其设计又源自
+本项目**参考（改写自）** [dingminhua/dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy)
+（MIT，Copyright (c) 2026 LaoDing）——它是一个 DeepSeek Harness（DSH）插件，用于把本机
+WorkBuddy 的登录模型接到 DSH 上。其设计又源自
 [corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect)
 （MIT，Copyright (c) 2026 Corrine Hu）。详见 `THIRD_PARTY_NOTICES.md` 与 `LICENSE`。
 
-改造点：去掉 DSH 插件外壳，只保留纯 Node 连接内核，做成 opencode 侧的独立 OpenAI 兼容代理。
+改造点：**去掉 DSH 插件外壳，只保留纯 Node 连接内核**，做成 opencode 侧的独立 OpenAI 兼容代理，
+并刻意简化了账号处理逻辑（见下一节）。模型目录、上游协议映射、token 刷新等核心逻辑均沿用原项目。
+
+## 不支持切换账号：请配合 workbuddy-switch 使用
+
+**本代理本身不具备、也不打算提供账号切换能力。** 它被刻意设计成「只读当前登录态」：
+
+- 每次请求都**实时重读**对应区域的 live 认证文件（国内 `workbuddy-desktop.info`，国际 `workbuddy-desktop-ai.info`），无缓存、无 mtime/hash 门禁；
+- **不做多账号选择、不做 selected 锁定、不扫描历史时间戳备份**；
+- token 刷新结果**只存在进程内存**，绝不写回桌面端文件、不落地任何副本。
+
+因此，**切换账号必须依赖第三方工具**：
+
+> **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)** —— WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri，MIT）。
+
+workbuddy-switch 负责把目标账号写入 live 认证文件；本代理在下一次请求时自动跟随。
+**不装它就只能用当前已登录的那一个账号。**
+
+使用流程：
+
+1. 用 [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 切换到想用的账号；
+2. 无需重启本代理，下一次对话请求即使用新账号；
+3. 若切号后立刻报 401，检查是否两个区域（国内/国际）的账号串了——本代理会校验 `domain` 与端口是否匹配。
+
+> 之所以这样设计：账号切换涉及备份/关闭桌面端/写入/重启等重操作，且要处理多账号密钥存储，
+> 交给专门的工具更稳妥；本代理保持无状态、可随时跟随，避免账号状态两处维护而互相打架。
 
 ## 运行要求
 
@@ -155,6 +186,8 @@ workbuddy-proxy/
 | 现象 | 处理 |
 | --- | --- |
 | `/status` 显示 `signed-out` | 先在对应区域登录 WorkBuddy 桌面端；或检查 `WORKBUDDY_*_AUTH_FILE` 指向 |
+| **想换账号** | 本代理不支持切号，请用 [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 切换；切换后无需重启代理 |
+| 切号后立刻 401 | 两个区域的账号串了，检查国内/国际 live 文件是否对调 |
 | 端口未监听 | 查看 `logs\proxy.err.log`；确认 Node 为 22.19+/24+ |
 | 报 `domain 区域不符` | 该端口收到了另一区域的账号，检查两个登录态文件是否串了 |
 | opencode 里看不到新模型 | 重启 opencode；再跑 `verify-config.cjs` 确认注入成功 |
