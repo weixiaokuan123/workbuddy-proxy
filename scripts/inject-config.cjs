@@ -2,10 +2,6 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const cfgPath = path.join(__dirname, '..', '..', 'opencode.jsonc')
-// 插件安装目录（opencode 目录下的 workbuddy-proxy），随安装位置自动推导，
-// 不写死任何用户主目录，便于分享给他人。
-const proxyRoot = path.join(__dirname, '..')
-const keyPath = (name) => path.join(proxyRoot, 'keys', name).replace(/\\/g, '/')
 let raw = fs.readFileSync(cfgPath, 'utf8')
 
 // 去掉 JSONC 注释（行注释 // 与块注释），简单处理以能解析
@@ -33,12 +29,11 @@ const strip = (s) => {
   return out
 }
 
-// 剥掉 UTF-8 BOM：opencode.jsonc 常由 PowerShell/编辑器以带 BOM 方式保存，
-// JSON.parse 不能容忍 BOM，否则报 "Unexpected token '﻿'"。
-const hadBom = raw.charCodeAt(0) === 0xFEFF
-const body = hadBom ? raw.slice(1) : raw
-const cfg = JSON.parse(strip(body))
+const cfg = JSON.parse(strip(raw))
 cfg.provider = cfg.provider || {}
+
+const root = path.join(__dirname, '..')
+const keyPath = (f) => path.join(root, 'keys', f).replace(/\\/g, '/')
 
 const limit = (context, output) => ({ context, output })
 const textOnly = () => ({ modalities: { input: ['text'], output: ['text'] } })
@@ -84,7 +79,68 @@ cfg.provider['workbuddy-global'] = {
 }
 
 fs.copyFileSync(cfgPath, cfgPath + '.bak.workbuddy')
-// 保持原有的 BOM 状态，避免改变 opencode 对该文件的读取行为。
-const out = JSON.stringify(cfg, null, 2) + '\n'
-fs.writeFileSync(cfgPath, (hadBom ? '\uFEFF' : '') + out, 'utf8')
-console.log('providers injected; backup at opencode.jsonc.bak.workbuddy')
+
+// ===== 多账号：从账号库为每个账号自动生成一个 provider =====
+// 端口规则与 src/serve.ts 一致：第 i 个账号 = 39320 + i
+async function injectAccountProviders() {
+  let accounts = []
+  try {
+    const raw = fs.readFileSync(path.join(root, 'state', 'accounts.json'), 'utf8')
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) accounts = parsed
+  } catch { /* 无账号库则跳过 */ }
+
+  if (accounts.length === 0) return 0
+
+  // 用第一个账号端点的模型目录作为模板（拉不到就用国内默认列表）
+  let templateModels = null
+  try {
+    const keyFile = path.join(root, 'keys', 'acct-0.key')
+    const key = fs.readFileSync(keyFile, 'utf8').trim()
+    const res = await fetch('http://127.0.0.1:39320/v1/models', {
+      headers: { Authorization: 'Bearer ' + key }, signal: AbortSignal.timeout(8000),
+    })
+    if (res.ok) {
+      const j = await res.json()
+      if (Array.isArray(j.data) && j.data.length > 0) templateModels = j.data
+    }
+  } catch { /* 代理未启动时用默认 */ }
+
+  const baseModels = templateModels
+    ?? Object.entries(cfg.provider['workbuddy-cn']?.models ?? {}).map(([id]) => ({ id }))
+
+  let count = 0
+  accounts.forEach((a, i) => {
+    const port = 39320 + i
+    const providerId = `workbuddy-acct${i}`
+    const models = {}
+    for (const m of baseModels) {
+      if (typeof m === 'string') models[m] = { name: m }
+      else models[m.id] = { name: m.id }
+    }
+    cfg.provider[providerId] = {
+      npm: '@ai-sdk/openai-compatible',
+      name: `WorkBuddy·${a.nickname || a.uin || a.label || ('账号' + i)}`,
+      options: {
+        baseURL: `http://127.0.0.1:${port}/v1`,
+        apiKey: `{file:${keyPath(`acct-${i}.key`)}}`,
+      },
+      models,
+    }
+    count++
+  })
+  return count
+}
+
+injectAccountProviders().then(accountCount => {
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+  console.log('providers injected; backup at opencode.jsonc.bak.workbuddy')
+  const providers = Object.keys(cfg.provider).filter(k => k.startsWith('workbuddy'))
+  console.log('WorkBuddy providers:', providers.join(', '))
+  console.log(accountCount > 0
+    ? `已注入 ${accountCount} 个账号 provider（端口 39320 起）`
+    : '未发现账号库（state/accounts.json），仅注入 live 两个区域')
+}).catch(e => {
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', 'utf8')
+  console.error('账号 provider 注入失败（已写入基础 provider）:', e.message)
+})

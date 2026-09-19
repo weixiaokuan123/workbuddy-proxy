@@ -12,6 +12,8 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LiveCredentialStore } from './auth.ts'
+import { AccountCredentialStore } from './account-store.ts'
+import { AccountStore, regionOfDomain, type StoredAccount } from './accounts.ts'
 import { WorkBuddyCatalog } from './catalog.ts'
 import { createWorkBuddyShim, type WorkBuddyShim, type ShimLogger } from './shim.ts'
 import { WorkBuddyUpstreamClient, type WorkBuddyRegion } from './upstream.ts'
@@ -23,6 +25,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
 const KEYS_DIR = join(ROOT, 'keys')
 const STATE_DIR = join(ROOT, 'state')
+const ACCOUNTS_FILE = join(STATE_DIR, 'accounts.json')
 
 const SIGNIN_ENABLED = (process.env['WORKBUDDY_SIGNIN'] ?? 'on') !== 'off'
 const SIGNIN_START_HOUR = Number(process.env['WORKBUDDY_SIGNIN_START_HOUR'] ?? 7)
@@ -30,15 +33,23 @@ const SIGNIN_END_HOUR = Number(process.env['WORKBUDDY_SIGNIN_END_HOUR'] ?? 10)
 const SIGNIN_TICK_MS = 5 * 60 * 1000
 const SIGNIN_INITIAL_DELAY_MS = 60 * 1000
 
+/** 账号模式端口段：账号 i 使用 BASE + i（39320 起）。 */
+const ACCOUNT_PORT_BASE = Number(process.env['WORKBUDDY_ACCOUNT_PORT_BASE'] ?? 39320)
+
 interface RegionRuntime {
+  /** 运行时标识：live-cn / live-global / acct:<key> */
+  id: string
+  label: string
   region: WorkBuddyRegion
   port: number
   keyFile: string
-  store: LiveCredentialStore
+  store: LiveCredentialStore | AccountCredentialStore
   client: WorkBuddyUpstreamClient
   catalog: WorkBuddyCatalog
   signin: WorkBuddySigninService
   scheduler: SigninScheduler
+  /** 账号模式下记录账号 key，用于签到调度命名 */
+  accountKey?: string
   shim?: WorkBuddyShim
 }
 
@@ -90,36 +101,73 @@ async function main(): Promise<void> {
   const client = new WorkBuddyUpstreamClient()
   let signinTimer: NodeJS.Timeout | undefined
 
-  const runtimes: RegionRuntime[] = (['cn', 'global'] as WorkBuddyRegion[]).map(region => {
-    const store = new LiveCredentialStore({
+  if (SIGNIN_ENABLED) await mkdir(STATE_DIR, { recursive: true, mode: 0o700 })
+
+  // 共享签到状态文件（live 与账号共用一份，target 名区分）
+  const schedulerOf = (): SigninScheduler => new SigninScheduler({
+    stateFile: join(STATE_DIR, 'signin-state.json'),
+    startHour: SIGNIN_START_HOUR,
+    endHour: SIGNIN_END_HOUR,
+    log: m => logger.info(m),
+  })
+
+  const runtimes: RegionRuntime[] = []
+  const accounts = new AccountStore(ACCOUNTS_FILE)
+
+  // ---- 模式 1：跟随官方 live 登录态（原有行为，端口 39301/39302）----
+  const liveMode = (process.env['WORKBUDDY_LIVE_MODE'] ?? 'on') !== 'off'
+  if (liveMode) {
+    for (const region of (['cn', 'global'] as WorkBuddyRegion[])) {
+      const store = new LiveCredentialStore({ region, refresh: credential => client.refreshToken(credential) })
+      runtimes.push({
+        id: `live-${region}`,
+        label: `${region}·当前登录`,
+        region,
+        port: REGION_PORTS[region],
+        keyFile: join(KEYS_DIR, `${region}.key`),
+        store,
+        client,
+        catalog: new WorkBuddyCatalog(region),
+        signin: new WorkBuddySigninService(store, client),
+        scheduler: schedulerOf(),
+      })
+    }
+  }
+
+  // ---- 模式 2：账号库（每账号一端口，39320 起）----
+  const stored: StoredAccount[] = await accounts.load()
+  stored.forEach((account, index) => {
+    const region = account.region ?? regionOfDomain(account.domain)
+    const store = new AccountCredentialStore({
+      accountKey: account.key,
       region,
+      accounts,
       refresh: credential => client.refreshToken(credential),
     })
-    const scheduler = new SigninScheduler({
-      stateFile: join(STATE_DIR, 'signin-state.json'),
-      startHour: SIGNIN_START_HOUR,
-      endHour: SIGNIN_END_HOUR,
-      log: m => logger.info(m),
-    })
-    return {
+    runtimes.push({
+      id: `acct:${account.key}`,
+      label: `${region}·${account.nickname ?? account.uin ?? account.label}`,
       region,
-      port: REGION_PORTS[region],
-      keyFile: join(KEYS_DIR, `${region}.key`),
+      port: ACCOUNT_PORT_BASE + index,
+      keyFile: join(KEYS_DIR, `acct-${index}.key`),
       store,
       client,
       catalog: new WorkBuddyCatalog(region),
       signin: new WorkBuddySigninService(store, client),
-      scheduler,
-    }
+      scheduler: schedulerOf(),
+      accountKey: account.key,
+    })
   })
 
-  if (SIGNIN_ENABLED) await mkdir(STATE_DIR, { recursive: true, mode: 0o700 })
+  if (runtimes.length === 0) {
+    logger.warn('没有可用的运行时（live 模式关闭且账号库为空）')
+  }
 
   const shims: WorkBuddyShim[] = []
   for (const rt of runtimes) {
     if (SIGNIN_ENABLED) {
-      const plan = await rt.scheduler.plan(rt.region)
-      logger.info(`workbuddy(${rt.region}) 今日签到计划 ${formatSec(plan.runAtSec)}`)
+      const plan = await rt.scheduler.plan(rt.id)
+      logger.info(`workbuddy(${rt.label}) 今日签到计划 ${formatSec(plan.runAtSec)}`)
     }
     const token = await loadOrCreateKey(rt.keyFile)
     const shim = createWorkBuddyShim({
@@ -131,12 +179,14 @@ async function main(): Promise<void> {
       catalog: rt.catalog,
       logger,
       signinStatus: SIGNIN_ENABLED ? async () => {
-        const entry = await rt.scheduler.entry(rt.region) ?? await rt.scheduler.plan(rt.region)
+        const entry = await rt.scheduler.entry(rt.id) ?? await rt.scheduler.plan(rt.id)
         let view: unknown = null
         let error: string | undefined
         try { view = await rt.signin.getStatus() }
         catch (e) { error = e instanceof Error ? e.message : String(e) }
         return {
+          runtime: rt.id,
+          label: rt.label,
           region: rt.region,
           scheduledAt: formatSec(entry.runAtSec),
           claimedToday: entry.claimed,
@@ -146,26 +196,25 @@ async function main(): Promise<void> {
         }
       } : undefined,
       signinClaim: SIGNIN_ENABLED ? async () => {
-        const outcome = await rt.scheduler.runNow(rt.region, () => rt.signin.claim())
-        return { region: rt.region, ...outcome }
+        const outcome = await rt.scheduler.runNow(rt.id, () => rt.signin.claim())
+        return { runtime: rt.id, label: rt.label, region: rt.region, ...outcome }
       } : undefined,
     })
     rt.shim = shim
     shims.push(shim)
     await shim.ready
     logger.info(
-      `workbuddy(${rt.region}) 已监听 ${shim.baseUrl()} `
+      `workbuddy(${rt.label}) 已监听 ${shim.baseUrl()} `
       + `(key=${rt.keyFile}, models=${rt.catalog.current().length})`,
     )
-    // 不阻塞启动：尽力刷新线上目录
     void refreshModels(rt)
   }
 
-  // 每日签到：到当天随机时刻自动领取
+  // 每日签到：到当天随机时刻自动领取（每个运行时独立随机）
   async function signinTick(): Promise<void> {
     for (const rt of runtimes) {
       try {
-        await rt.scheduler.runIfDue(rt.region, () => rt.signin.claim())
+        await rt.scheduler.runIfDue(rt.id, () => rt.signin.claim())
       } catch {
         // 未登录 / token 失效：静默跳过
       }
@@ -175,7 +224,7 @@ async function main(): Promise<void> {
     setTimeout(() => { void signinTick() }, SIGNIN_INITIAL_DELAY_MS).unref()
     signinTimer = setInterval(() => { void signinTick() }, SIGNIN_TICK_MS)
     signinTimer.unref()
-    logger.info(`每日签到已启用：本地 ${SIGNIN_START_HOUR}:00–${SIGNIN_END_HOUR}:00 随机时刻自动领取`)
+    logger.info(`每日签到已启用：本地 ${SIGNIN_START_HOUR}:00–${SIGNIN_END_HOUR}:00 随机时刻自动领取（每账号独立）`)
   }
 
   // 每 6 小时刷新一次模型目录
@@ -185,7 +234,13 @@ async function main(): Promise<void> {
   }, REFRESH_INTERVAL)
   timer.unref()
 
-  logger.info(`workbuddy-proxy ${WORKBUDDY_CONNECT_VERSION} 就绪：国内 ${REGION_PORTS.cn} / 国际 ${REGION_PORTS.global}`)
+  const liveCount = runtimes.filter(r => r.accountKey === undefined).length
+  const acctCount = runtimes.length - liveCount
+  logger.info(
+    `workbuddy-proxy ${WORKBUDDY_CONNECT_VERSION} 就绪：`
+    + `live ${liveCount} 个（${REGION_PORTS.cn}/${REGION_PORTS.global}）`
+    + (acctCount > 0 ? ` + 账号 ${acctCount} 个（端口 ${ACCOUNT_PORT_BASE} 起）` : ''),
+  )
 
   let closing = false
   const shutdown = async (signal: string): Promise<void> => {

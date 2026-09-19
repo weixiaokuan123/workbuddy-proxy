@@ -11,8 +11,13 @@
  * @module workbuddy-proxy/signin
  */
 
-import type { LiveCredentialStore } from './auth.ts'
+import type { WorkBuddyCredential } from './auth.ts'
 import type { WorkBuddyUpstreamClient } from './upstream.ts'
+
+/** 只要求 resolve()，LiveCredentialStore 与 AccountCredentialStore 都满足。 */
+export interface SigninCredentialStore {
+  resolve(): Promise<WorkBuddyCredential>
+}
 
 export interface WorkBuddySigninView {
   active: boolean
@@ -26,10 +31,10 @@ export interface WorkBuddySigninView {
 }
 
 export class WorkBuddySigninService {
-  private readonly store: LiveCredentialStore
+  private readonly store: SigninCredentialStore
   private readonly client: WorkBuddyUpstreamClient
 
-  constructor(store: LiveCredentialStore, client: WorkBuddyUpstreamClient) {
+  constructor(store: SigninCredentialStore, client: WorkBuddyUpstreamClient) {
     this.store = store
     this.client = client
   }

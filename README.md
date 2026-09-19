@@ -150,9 +150,65 @@ curl -H "Authorization: Bearer $KEY" http://127.0.0.1:39301/status
 | `WORKBUDDY_AUTH_FILE` | 无 | 兼容旧版单变量（区域专属变量优先） |
 | `OPENCODE_CONFIG_DIR` | `~/.config/opencode` | opencode 配置目录（注入/验证脚本使用） |
 
+## 多账号（内置，可替代 workbuddy-switch）
+
+本代理**自带多账号能力**，不依赖外部 switch App。
+
+- **账号库**：`state/accounts.json`（含 token，已 gitignore，绝不入库）。
+- **每个账号一个端口**：第 i 个账号监听 `39320 + i`，opencode 侧自动生成对应 provider，
+  **多个账号可同时使用、并行跑任务**——这是「切换式」工具做不到的。
+- **不碰官方 live 文件**：账号的 token 只存代理库；刷新结果也只写回库。
+  因此**无需关闭 WorkBuddy 桌面端**，也不会与客户端互相打架。
+
+### 管理账号
+
+```powershell
+# 列出账号库（含 token 剩余时间、对应端口）
+node scripts\accounts.cjs list
+
+# 从 workbuddy-switch 导入（已装 switch 时零迁移成本）
+node scripts\accounts.cjs import-switch
+
+# 收录当前 WorkBuddy 登录态为新账号（替代「扫码加账号」）
+# 用法：先在 WorkBuddy 里登录目标账号，然后执行：
+node scripts\accounts.cjs capture cn
+
+# 删除账号
+node scripts\accounts.cjs remove <key>
+```
+
+改完账号后重新注入 provider 并重启 opencode：
+
+```powershell
+node scripts\inject-config.cjs
+```
+
+端口分配（`src/serve.ts` 的 `ACCOUNT_PORT_BASE`，默认 39320）：
+
+| 端口 | 用途 |
+| --- | --- |
+| 39301 / 39302 | 跟随官方当前登录态（live 模式）|
+| 39320 | 账号库第 0 个账号 |
+| 39321 | 账号库第 1 个账号 |
+| … | 以此类推 |
+
+每个账号**独立随机签到**（07:00–10:00 各自随机），互不影响。
+
+> 关于加新账号：本代理不内嵌 OAuth 扫码流程（那是登录态最脆弱的部分）。
+> 加账号只需「在 WorkBuddy 里登录一次 + `capture` 一下」，比扫码更简单。
+
+## 每日自动签到
+
+- 每天早上 **07:00–10:00 之间随机一个时刻**自动领取每日签到积分（国内/国际各自独立随机）。
+- 计划时刻当天首次运行即固定，持久化在 `state/signin-state.json`（已 gitignore），重启不重摇。
+- 端点：`POST {billing}/v2/billing/meter/checkin-activity-status`（状态）、`POST .../daily-checkin`（领取）。
+- 三重防重：进程内当天门禁 + 领取前先查状态 + 服务端 `alreadyCheckedIn` 幂等。
+- 环境变量：`WORKBUDDY_SIGNIN=off` 关闭；`WORKBUDDY_SIGNIN_START_HOUR=7`、`WORKBUDDY_SIGNIN_END_HOUR=10` 调整窗口。
+- 查看状态：`GET http://127.0.0.1:39301/signin/status`；手动触发：`POST http://127.0.0.1:39301/signin/claim`（幂等）。
+
 ## 账号与隐私
 
-- 本仓库**不含任何账号凭据**。`keys/` 下的 `*.key` 在首次启动时随机生成（0600 权限），`logs/` 亦不入库。
+- 本仓库**不含任何账号凭据**。`keys/` 下的 `*.key` 在首次启动时随机生成（0600 权限），`logs/`、`state/` 亦不入库。
 - 登录态来自 WorkBuddy 桌面端本地文件，只在进程内存中刷新，**永不写回、不落地、不联网外传**。
 - 各平台登录态读取路径见 `src/auth.ts` 的 `defaultDesktopAuthDirs()`，可用上表环境变量覆盖。
 

@@ -17,9 +17,15 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
-import type { LiveCredentialStore } from './auth.ts'
+import type { WorkBuddyAuthStatus, WorkBuddyCredential } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
 import { prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+
+/** shim 只要求这两个方法，LiveCredentialStore 与 AccountCredentialStore 都满足。 */
+export interface CredentialStoreLike {
+  resolve(): Promise<WorkBuddyCredential>
+  status(): Promise<WorkBuddyAuthStatus>
+}
 
 export interface ShimLogger {
   info(...args: unknown[]): void
@@ -40,7 +46,7 @@ export interface WorkBuddyShimOptions {
   host?: string
   /** 固定 bearer；不传则每次进程随机生成。 */
   token?: string
-  store: LiveCredentialStore
+  store: CredentialStoreLike
   client: Pick<WorkBuddyUpstreamClient, 'chatStream' | 'fetchCredits'>
   catalog: WorkBuddyCatalog
   logger?: ShimLogger
