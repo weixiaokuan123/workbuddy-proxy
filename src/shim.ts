@@ -44,6 +44,10 @@ export interface WorkBuddyShimOptions {
   client: Pick<WorkBuddyUpstreamClient, 'chatStream' | 'fetchCredits'>
   catalog: WorkBuddyCatalog
   logger?: ShimLogger
+  /** 只读签到状态；不提供则 /signin/* 返回 404 */
+  signinStatus?: () => Promise<unknown>
+  /** 立即检查/领取今日签到（幂等） */
+  signinClaim?: () => Promise<unknown>
 }
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
@@ -181,6 +185,16 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       if (req.method === 'GET' && (url === '/status' || url === '/status/')) {
         await status(req, res)
         return
+      }
+      if (url.split('?')[0] === '/signin/status' && req.method === 'GET') {
+        if (!options.signinStatus) { writeOpenAIError(res, 404, 'not_found', 'sign-in not available'); return }
+        try { writeJson(res, 200, await options.signinStatus()); return }
+        catch (error) { writeOpenAIError(res, 502, 'signin_error', error instanceof Error ? error.message : String(error)); return }
+      }
+      if (url.split('?')[0] === '/signin/claim' && req.method === 'POST') {
+        if (!options.signinClaim) { writeOpenAIError(res, 404, 'not_found', 'sign-in not available'); return }
+        try { writeJson(res, 200, await options.signinClaim()); return }
+        catch (error) { writeOpenAIError(res, 502, 'signin_error', error instanceof Error ? error.message : String(error)); return }
       }
       if (req.method === 'POST' && (url === '/v1/chat/completions' || url === '/v1/chat/completions/')) {
         await chatCompletions(req, res)

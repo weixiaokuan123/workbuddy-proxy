@@ -16,10 +16,19 @@ import { WorkBuddyCatalog } from './catalog.ts'
 import { createWorkBuddyShim, type WorkBuddyShim, type ShimLogger } from './shim.ts'
 import { WorkBuddyUpstreamClient, type WorkBuddyRegion } from './upstream.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
+import { WorkBuddySigninService } from './signin.ts'
+import { SigninScheduler, formatSec } from './scheduler.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
 const KEYS_DIR = join(ROOT, 'keys')
+const STATE_DIR = join(ROOT, 'state')
+
+const SIGNIN_ENABLED = (process.env['WORKBUDDY_SIGNIN'] ?? 'on') !== 'off'
+const SIGNIN_START_HOUR = Number(process.env['WORKBUDDY_SIGNIN_START_HOUR'] ?? 7)
+const SIGNIN_END_HOUR = Number(process.env['WORKBUDDY_SIGNIN_END_HOUR'] ?? 10)
+const SIGNIN_TICK_MS = 5 * 60 * 1000
+const SIGNIN_INITIAL_DELAY_MS = 60 * 1000
 
 interface RegionRuntime {
   region: WorkBuddyRegion
@@ -28,6 +37,8 @@ interface RegionRuntime {
   store: LiveCredentialStore
   client: WorkBuddyUpstreamClient
   catalog: WorkBuddyCatalog
+  signin: WorkBuddySigninService
+  scheduler: SigninScheduler
   shim?: WorkBuddyShim
 }
 
@@ -77,11 +88,18 @@ async function refreshModels(rt: RegionRuntime): Promise<void> {
 async function main(): Promise<void> {
   await mkdir(KEYS_DIR, { recursive: true, mode: 0o700 })
   const client = new WorkBuddyUpstreamClient()
+  let signinTimer: NodeJS.Timeout | undefined
 
   const runtimes: RegionRuntime[] = (['cn', 'global'] as WorkBuddyRegion[]).map(region => {
     const store = new LiveCredentialStore({
       region,
       refresh: credential => client.refreshToken(credential),
+    })
+    const scheduler = new SigninScheduler({
+      stateFile: join(STATE_DIR, 'signin-state.json'),
+      startHour: SIGNIN_START_HOUR,
+      endHour: SIGNIN_END_HOUR,
+      log: m => logger.info(m),
     })
     return {
       region,
@@ -90,11 +108,19 @@ async function main(): Promise<void> {
       store,
       client,
       catalog: new WorkBuddyCatalog(region),
+      signin: new WorkBuddySigninService(store, client),
+      scheduler,
     }
   })
 
+  if (SIGNIN_ENABLED) await mkdir(STATE_DIR, { recursive: true, mode: 0o700 })
+
   const shims: WorkBuddyShim[] = []
   for (const rt of runtimes) {
+    if (SIGNIN_ENABLED) {
+      const plan = await rt.scheduler.plan(rt.region)
+      logger.info(`workbuddy(${rt.region}) 今日签到计划 ${formatSec(plan.runAtSec)}`)
+    }
     const token = await loadOrCreateKey(rt.keyFile)
     const shim = createWorkBuddyShim({
       region: rt.region,
@@ -104,6 +130,25 @@ async function main(): Promise<void> {
       client,
       catalog: rt.catalog,
       logger,
+      signinStatus: SIGNIN_ENABLED ? async () => {
+        const entry = await rt.scheduler.entry(rt.region) ?? await rt.scheduler.plan(rt.region)
+        let view: unknown = null
+        let error: string | undefined
+        try { view = await rt.signin.getStatus() }
+        catch (e) { error = e instanceof Error ? e.message : String(e) }
+        return {
+          region: rt.region,
+          scheduledAt: formatSec(entry.runAtSec),
+          claimedToday: entry.claimed,
+          lastResult: entry.result,
+          view,
+          ...(error === undefined ? {} : { error }),
+        }
+      } : undefined,
+      signinClaim: SIGNIN_ENABLED ? async () => {
+        const outcome = await rt.scheduler.runNow(rt.region, () => rt.signin.claim())
+        return { region: rt.region, ...outcome }
+      } : undefined,
     })
     rt.shim = shim
     shims.push(shim)
@@ -114,6 +159,23 @@ async function main(): Promise<void> {
     )
     // 不阻塞启动：尽力刷新线上目录
     void refreshModels(rt)
+  }
+
+  // 每日签到：到当天随机时刻自动领取
+  async function signinTick(): Promise<void> {
+    for (const rt of runtimes) {
+      try {
+        await rt.scheduler.runIfDue(rt.region, () => rt.signin.claim())
+      } catch {
+        // 未登录 / token 失效：静默跳过
+      }
+    }
+  }
+  if (SIGNIN_ENABLED) {
+    setTimeout(() => { void signinTick() }, SIGNIN_INITIAL_DELAY_MS).unref()
+    signinTimer = setInterval(() => { void signinTick() }, SIGNIN_TICK_MS)
+    signinTimer.unref()
+    logger.info(`每日签到已启用：本地 ${SIGNIN_START_HOUR}:00–${SIGNIN_END_HOUR}:00 随机时刻自动领取`)
   }
 
   // 每 6 小时刷新一次模型目录
@@ -131,6 +193,7 @@ async function main(): Promise<void> {
     closing = true
     logger.info(`收到 ${signal}，正在关闭...`)
     clearInterval(timer)
+    if (signinTimer !== undefined) clearInterval(signinTimer)
     await Promise.allSettled(shims.map(shim => shim.close()))
     process.exit(0)
   }
