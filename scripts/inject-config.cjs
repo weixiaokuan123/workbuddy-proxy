@@ -109,6 +109,9 @@ async function injectAccountProviders() {
   const baseModels = templateModels
     ?? Object.entries(cfg.provider['workbuddy-cn']?.models ?? {}).map(([id]) => ({ id }))
 
+  // 安全命名：只用序号，永不使用账号昵称/UIN/手机号等个人信息，
+  // 避免本地界面或截图意外泄漏。
+  // 仅在调试日志里保留可识别标记（不写入配置）。
   let count = 0
   accounts.forEach((a, i) => {
     const port = 39320 + i
@@ -120,7 +123,7 @@ async function injectAccountProviders() {
     }
     cfg.provider[providerId] = {
       npm: '@ai-sdk/openai-compatible',
-      name: `WorkBuddy·${a.nickname || a.uin || a.label || ('账号' + i)}`,
+      name: `WorkBuddy 账号${String.fromCharCode(65 + i)}`,
       options: {
         baseURL: `http://127.0.0.1:${port}/v1`,
         apiKey: `{file:${keyPath(`acct-${i}.key`)}}`,
