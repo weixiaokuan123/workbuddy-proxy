@@ -20,6 +20,8 @@ import { Readable } from 'node:stream'
 import type { WorkBuddyAuthStatus, WorkBuddyCredential } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
 import { prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
+import { redactPaths } from './redact.ts'
 
 /** shim 只要求这两个方法，LiveCredentialStore 与 AccountCredentialStore 都满足。 */
 export interface CredentialStoreLike {
@@ -106,7 +108,8 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function writeOpenAIError(res: ServerResponse, status: number, kind: string, message: string): void {
-  writeJson(res, status, { error: { message, type: kind, code: kind } })
+  // 统一脱敏本机路径，避免日志/界面泄露真实用户名与目录。
+  writeJson(res, status, { error: { message: redactPaths(message), type: kind, code: kind } })
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -173,7 +176,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       }
       const url = req.url ?? '/'
       if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
-        writeJson(res, 200, { ok: true, region })
+        writeJson(res, 200, { ok: true, region, version: WORKBUDDY_CONNECT_VERSION })
         return
       }
       if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/')) {

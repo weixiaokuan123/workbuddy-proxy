@@ -1,6 +1,9 @@
 # 运行时生成的本地鉴权 key（含个人 bearer key，绝不入库）
 keys/*.key
 
+# 运行时状态：账号库(token)与签到记录，含个人凭据，绝不入库
+state/
+
 # 运行日志 / pid / 抓包残留
 logs/*
 !logs/.gitkeep
