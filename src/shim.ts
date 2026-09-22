@@ -195,6 +195,17 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         await status(req, res)
         return
       }
+      if (req.method === 'GET' && (url === '/credits' || url === '/credits/')) {
+        try {
+          const credential = await store.resolve()
+          const credits = await options.client.fetchCredits(credential)
+          writeJson(res, 200, { region, ...credits })
+          return
+        } catch (error) {
+          writeOpenAIError(res, 502, 'credits_error', error instanceof Error ? error.message : String(error))
+          return
+        }
+      }
       if (url.split('?')[0] === '/signin/status' && req.method === 'GET') {
         if (!options.signinStatus) { writeOpenAIError(res, 404, 'not_found', 'sign-in not available'); return }
         try { writeJson(res, 200, await options.signinStatus()); return }
