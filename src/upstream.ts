@@ -121,7 +121,7 @@ export interface WorkBuddyRefreshOutcome {
 /** Chat answer: either a live SSE response or a classified failure. */
 export type WorkBuddyChatResult =
   | { ok: true; response: Response }
-  | { ok: false; status: number; kind: UpstreamErrorKind; message: string }
+  | { ok: false; status: number; kind: UpstreamErrorKind; message: string; code?: number }
 
 const CN_CHAT_BASE = 'https://copilot.tencent.com'
 const CN_BILLING_BASE = 'https://www.codebuddy.cn'
@@ -178,9 +178,59 @@ const HARD_CREDIT_MARKERS: readonly string[] = [
 /** Session-invalidation markers that mean "sign in again in the WorkBuddy app". */
 const SESSION_DEAD_MARKERS: readonly string[] = ['Offline user session not found', '12153']
 
+/**
+ * 频率限制标记：该账号的额度暂时耗尽，但会自动恢复（区别于积分永久不足）。
+ * 命中后代理应切换到同区域的其他账号，而不是直接把错误抛给客户端。
+ */
+const RATE_LIMIT_MARKERS: readonly string[] = [
+  '频率限制', '超出频率', '请求过于频繁', 'too many requests', 'rate limit', 'rate-limit',
+]
+
+/** 业务错误码：腾讯网关的频率限制码。 */
+const RATE_LIMIT_CODES: readonly number[] = [6004]
+
+/**
+ * 从上游错误文案里解析额度重置时间。
+ * 实测文案形如 `将在 2026-09-23 08:44:36 UTC+8 重置`，
+ * 也可能出现 `将在 2026-09-23 08:44:36 重置`（无时区）。
+ * 解析失败返回 undefined（调用方退化为固定冷却）。
+ */
+export function parseRateLimitResetMs(text: string): number | undefined {
+  const m = text.match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\s*UTC([+-])(\d{1,2})(?::?(\d{2}))?)?/)
+  if (m === null) return undefined
+  // 有 UTC±N 偏移时按其换算到 UTC；无偏移时按本地时区理解
+  if (m[7] !== undefined && m[8] !== undefined) {
+    const offsetMin = Number(m[8]) * 60 + Number(m[9] ?? 0)
+    const sign = m[7] === '-' ? -1 : 1
+    const utcMs = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))
+    return utcMs - sign * offsetMin * 60_000
+  }
+  const local = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))
+  return Number.isNaN(local.getTime()) ? undefined : local.getTime()
+}
+
+/** 从响应正文里抽取业务错误码（`"code":6004` 形态）。 */
+export function parseEnvelopeCode(body: string): number | undefined {
+  const m = body.match(/"code"\s*:\s*(\d+)/)
+  return m === null ? undefined : Number(m[1])
+}
+
+/** 该错误是否为「账号额度暂时耗尽、可切换账号解决」。 */
+export function isRateLimited(status: number, body: string): boolean {
+  const code = parseEnvelopeCode(body)
+  if (code !== undefined && RATE_LIMIT_CODES.includes(code)) return true
+  if (status === 429) return true
+  for (const marker of RATE_LIMIT_MARKERS) {
+    if (body.toLowerCase().includes(marker.toLowerCase())) return true
+  }
+  return false
+}
+
 /** Classify an upstream failure from its HTTP status and body excerpt. */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
   if (status === 402) return 'hard_credit'
+  // 频率限制先于额度判断：6004 文案里也含「使用量」字样，但它是可恢复的
+  if (isRateLimited(status, body)) return 'soft_rate'
   const lower = body.toLowerCase()
   for (const marker of HARD_CREDIT_MARKERS) {
     if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
@@ -188,7 +238,6 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   for (const marker of SESSION_DEAD_MARKERS) {
     if (body.includes(marker)) return 'session_dead'
   }
-  if (status === 429) return 'soft_rate'
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
   if (status >= 400) return 'client'
@@ -540,13 +589,35 @@ export class WorkBuddyUpstreamClient {
     } catch (error: unknown) {
       return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
     }
-    if (response.ok) return { ok: true, response }
+    if (response.ok) {
+      // 关键：上游有时以 HTTP 200 + JSON 错误信封返回业务失败
+      // （如 `{"code":6004,"msg":"您的使用量已超出频率限制…"}`）。
+      // 若不识别，这段 JSON 会被当成 SSE 流原样转发给客户端，
+      // 既无法触发切号，也无法给出明确报错。
+      const ctype = (response.headers.get('content-type') ?? '').toLowerCase()
+      if (!ctype.includes('text/event-stream')) {
+        const text = (await response.text()).slice(0, ERROR_BODY_LIMIT)
+        const code = parseEnvelopeCode(text)
+        // 只有确实是错误信封（code 非 0）才判失败；否则视为正常非流式应答
+        if (code !== undefined && code !== 0) {
+          return {
+            ok: false,
+            status: response.status,
+            kind: classifyUpstreamError(response.status, text),
+            message: text,
+            code,
+          }
+        }
+      }
+      return { ok: true, response }
+    }
     const text = (await response.text()).slice(0, ERROR_BODY_LIMIT)
     return {
       ok: false,
       status: response.status,
       kind: classifyUpstreamError(response.status, text),
       message: text,
+      code: parseEnvelopeCode(text),
     }
   }
 

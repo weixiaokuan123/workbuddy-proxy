@@ -15,7 +15,7 @@ import { LiveCredentialStore } from './auth.ts'
 import { AccountCredentialStore } from './account-store.ts'
 import { AccountStore, regionOfDomain, type StoredAccount } from './accounts.ts'
 import { WorkBuddyCatalog } from './catalog.ts'
-import { createWorkBuddyShim, type WorkBuddyShim, type ShimLogger } from './shim.ts'
+import { createWorkBuddyShim, RateLimitRegistry, type WorkBuddyShim, type ShimLogger } from './shim.ts'
 import { WorkBuddyUpstreamClient, type WorkBuddyRegion } from './upstream.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { WorkBuddySigninService } from './signin.ts'
@@ -163,6 +163,12 @@ async function main(): Promise<void> {
     logger.warn('没有可用的运行时（live 模式关闭且账号库为空）')
   }
 
+  // 跨端口共享的限流登记表：某账号被 6004 限流后，同区域所有端口都会跳过它
+  const rateLimitRegistry = new RateLimitRegistry()
+  // 候选池构造器：给定区域，返回该区域全部运行时的 (id, label, store)
+  const candidatesOf = (region: WorkBuddyRegion) =>
+    runtimes.filter(rt => rt.region === region).map(rt => ({ id: rt.id, label: rt.label, store: rt.store }))
+
   const shims: WorkBuddyShim[] = []
   for (const rt of runtimes) {
     if (SIGNIN_ENABLED) {
@@ -170,6 +176,7 @@ async function main(): Promise<void> {
       logger.info(`workbuddy(${rt.label}) 今日签到计划 ${formatSec(plan.runAtSec)}`)
     }
     const token = await loadOrCreateKey(rt.keyFile)
+    const sameRegion = candidatesOf(rt.region)
     const shim = createWorkBuddyShim({
       region: rt.region,
       port: rt.port,
@@ -178,6 +185,10 @@ async function main(): Promise<void> {
       client,
       catalog: rt.catalog,
       logger,
+      // 同区域多账号时才启用切换（单账号时行为不变）
+      failover: sameRegion.length > 1
+        ? { selfId: rt.id, candidates: () => candidatesOf(rt.region), registry: rateLimitRegistry }
+        : undefined,
       signinStatus: SIGNIN_ENABLED ? async () => {
         const entry = await rt.scheduler.entry(rt.id) ?? await rt.scheduler.plan(rt.id)
         let view: unknown = null

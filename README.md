@@ -197,6 +197,36 @@ node scripts\inject-config.cjs
 > 关于加新账号：本代理不内嵌 OAuth 扫码流程（那是登录态最脆弱的部分）。
 > 加账号只需「在 WorkBuddy 里登录一次 + `capture` 一下」，比扫码更简单。
 
+## 限额用尽自动换号
+
+某个账号的额度/频率用尽时，上游会返回这样的错误：
+
+```json
+{"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-09-23 08:44:36 UTC+8 重置，您也可以切换其他模型继续使用。","requestId":"..."}
+```
+
+代理会**自动改用同区域的其他账号**继续完成本次请求，而不是把这个错误直接抛给你：
+
+- **触发条件**：业务码 `6004`、HTTP `429`，或文案含「频率限制 / 超出频率 / too many requests」。
+  注意上游有时用 **HTTP 200 + 错误信封**返回它，代理也能识别。
+- **切换范围**：同一区域（cn / global）内的全部账号，包括 live 登录态与账号库里的账号。
+  当前端口的账号优先，其余按顺序尝试。
+- **记忆冷却**：被限流的账号会记下恢复时间（从「将在 … 重置」里解析），
+  在恢复前**所有端口都会跳过它**；解析不到时间则固定冷却 10 分钟。
+- **全部用尽才报错**：报错文案会注明「已尝试 N 个同区域账号，其中 M 个因额度限流被跳过」。
+- **不误伤真正的问题**：额度**永久**不足（积分不足 / HTTP 402）、请求本身不合法等，
+  不会被当成限流去换号，仍是直接报错。单账号用户行为完全不变。
+
+查看当前哪些账号处于限流冷却：
+
+```powershell
+# 任意端口的 /status 都会带 failover 字段
+curl -H "Authorization: Bearer <该端口的 key>" http://127.0.0.1:39301/status
+# → "failover": { "enabled": true, "candidates": 3, "rateLimited": [ { "id": "acct:...", "remainingSec": 1234 } ] }
+```
+
+> 单账号端口（如同一区域只有一个账号）不会启用切换，返回 `"failover"` 字段缺失。
+
 ## 每日自动签到
 
 - 每天早上 **07:00–10:00 之间随机一个时刻**自动领取每日签到积分（国内/国际各自独立随机）。
@@ -230,11 +260,21 @@ workbuddy-proxy/
     verify-config.cjs      校验注入结果（不打印 key 明文）
   src/
     auth.ts                只读桌面端登录态、内存内 token 刷新
+    accounts.ts            多账号库（兼容 workbuddy-switch 格式）
+    account-store.ts       账号库凭据 store（刷新写回库）
     catalog.ts             模型目录（静态 fallback + 上游刷新）
-    serve.ts               守护入口（双区域）
-    shim.ts                OpenAI 兼容回环端点
+    serve.ts               守护入口（双区域 + 每账号一端口）
+    shim.ts                OpenAI 兼容回环端点（含限额自动换号）
     upstream.ts            上游网关客户端与协议映射
     version.ts             版本常量
+  test/
+    failover.test.ts       限额换号模拟测试（无需网络、不耗额度）
+```
+
+运行测试（无副作用，不消耗任何账号额度）：
+
+```powershell
+node --test test/failover.test.ts
 ```
 
 ## 排错
@@ -242,10 +282,12 @@ workbuddy-proxy/
 | 现象 | 处理 |
 | --- | --- |
 | `/status` 显示 `signed-out` | 先在对应区域登录 WorkBuddy 桌面端；或检查 `WORKBUDDY_*_AUTH_FILE` 指向 |
-| **想换账号** | 本代理不支持切号，请用 [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 切换；切换后无需重启代理 |
+| **想换账号** | 用 `node scripts\accounts.cjs list` 查看；账号库见下方「多账号」。多个账号建议都注册为独立 provider 并行使用 |
 | 切号后立刻 401 | 两个区域的账号串了，检查国内/国际 live 文件是否对调 |
 | 端口未监听 | 查看 `logs\proxy.err.log`；确认 Node 为 22.19+/24+ |
 | 报 `domain 区域不符` | 该端口收到了另一区域的账号，检查两个登录态文件是否串了 |
+| 报错含「已尝试 N 个同区域账号」 | 该区域所有账号额度都已用尽（或都被限流）。查看 `/status` 的 `failover.rateLimited` 得知各自恢复时间 |
+| 某账号一直不被使用 | 它可能仍在限流冷却中，见 `/status` 的 `failover.rateLimited` |
 | opencode 里看不到新模型 | 重启 opencode；再跑 `verify-config.cjs` 确认注入成功 |
 | `.ps1` 中文乱码 | 跑 `node add-bom.cjs` 补 BOM |
 

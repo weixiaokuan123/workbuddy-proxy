@@ -19,7 +19,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Readable } from 'node:stream'
 import type { WorkBuddyAuthStatus, WorkBuddyCredential } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
-import { prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+import { parseRateLimitResetMs, prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { redactPaths } from './redact.ts'
 
@@ -27,6 +27,67 @@ import { redactPaths } from './redact.ts'
 export interface CredentialStoreLike {
   resolve(): Promise<WorkBuddyCredential>
   status(): Promise<WorkBuddyAuthStatus>
+}
+
+/**
+ * 单个候选账号（用于限流后切换）。
+ * `id` 需在本次进程内唯一且稳定（账号库 key 或 live-cn / live-global）。
+ */
+export interface FailoverCandidate {
+  id: string
+  label: string
+  store: CredentialStoreLike
+}
+
+/**
+ * 账号级限流登记表：记录某账号在何时之前不可用。
+ *
+ * 上游 6004 文案里给出重置时刻（如「将在 2026-09-23 08:44:36 UTC+8 重置」），
+ * 解析得到精确恢复时间；解析不到则退化为固定冷却窗（默认 10 分钟），
+ * 避免每次请求都去撞同一个已耗尽账号。
+ */
+export class RateLimitRegistry {
+  private readonly until = new Map<string, number>()
+  private readonly defaultCooldownMs: number
+
+  constructor(defaultCooldownMs = 10 * 60 * 1000) {
+    this.defaultCooldownMs = defaultCooldownMs
+  }
+
+  /** 记录某账号被限流；resetAtMs 缺省时用固定冷却。 */
+  mark(id: string, resetAtMs?: number): number {
+    // 上游给的重置时间可能早于本地时钟（时钟偏差），至少冷却 30 秒，避免立即复用
+    const until = Math.max(resetAtMs ?? 0, Date.now() + 30_000, resetAtMs === undefined ? Date.now() + this.defaultCooldownMs : 0)
+    this.until.set(id, until)
+    return until
+  }
+
+  /** 该账号现在是否仍处于限流冷却中。 */
+  isLimited(id: string): boolean {
+    const until = this.until.get(id)
+    if (until === undefined) return false
+    if (Date.now() >= until) {
+      this.until.delete(id)
+      return false
+    }
+    return true
+  }
+
+  /** 距离恢复还有多少毫秒（0 表示可用）。 */
+  remainingMs(id: string): number {
+    return this.isLimited(id) ? Math.max(0, (this.until.get(id) ?? 0) - Date.now()) : 0
+  }
+
+  /** 只读快照，供面板/状态接口展示。 */
+  snapshot(): Array<{ id: string; untilMs: number; remainingMs: number }> {
+    const now = Date.now()
+    const out: Array<{ id: string; untilMs: number; remainingMs: number }> = []
+    for (const [id, until] of this.until) {
+      if (now >= until) continue
+      out.push({ id, untilMs: until, remainingMs: until - now })
+    }
+    return out
+  }
 }
 
 export interface ShimLogger {
@@ -56,6 +117,17 @@ export interface WorkBuddyShimOptions {
   signinStatus?: () => Promise<unknown>
   /** 立即检查/领取今日签到（幂等） */
   signinClaim?: () => Promise<unknown>
+  /**
+   * 限流切换：返回**同区域**的全部候选（含本端口自身），由 shim 决定尝试顺序。
+   * 不提供则退化为单账号行为（遇限流直接报错）。
+   */
+  failover?: {
+    /** 本端口对应账号的 id（须出现在 candidates 里）。 */
+    selfId: string
+    candidates: () => readonly FailoverCandidate[]
+    /** 跨端口共享的限流登记表。 */
+    registry: RateLimitRegistry
+  }
 }
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
@@ -158,7 +230,12 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
   server.listen(port, host)
 
-  const baseUrl = (): string => `http://${host}:${port}`
+  const baseUrl = (): string => {
+    // 端口传 0 时由系统分配，须从实际监听地址读取（测试与多实例场景用得到）
+    const addr = server.address()
+    const actual = typeof addr === 'object' && addr !== null ? addr.port : port
+    return `http://${host}:${actual}`
+  }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
@@ -233,6 +310,14 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   async function status(_req: IncomingMessage, res: ServerResponse): Promise<void> {
     const auth = await store.status()
     const payload: Record<string, unknown> = { region, auth, models: catalog.current().length }
+    if (options.failover !== undefined) {
+      const limited = options.failover.registry.snapshot()
+      payload['failover'] = {
+        enabled: true,
+        candidates: options.failover.candidates().length,
+        rateLimited: limited.map(l => ({ id: l.id, remainingSec: Math.ceil(l.remainingMs / 1000) })),
+      }
+    }
     if (auth.state === 'signed-in') {
       try {
         const credential = await store.resolve()
@@ -250,47 +335,106 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type must be application/json')
       return
     }
-    let credential
-    try {
-      credential = await store.resolve()
-    } catch (error: unknown) {
-      writeOpenAIError(res, 401, 'not_signed_in', String(error instanceof Error ? error.message : error))
-      return
-    }
 
     const raw = (await readBody(req)).toString('utf8')
     const prepared = prepareChatBody(raw)
 
     const controller = new AbortController()
     req.on('close', () => controller.abort())
-    const result = await client.chatStream(credential, prepared, controller.signal)
 
-    if (!result.ok) {
-      writeOpenAIError(
-        res,
-        KIND_STATUS[result.kind],
-        result.kind,
-        `workbuddy upstream ${result.kind} (http ${result.status}): ${result.message.slice(0, 400)}`,
-      )
-      return
+    // 尝试顺序：本端口的 store 优先，其后是同区域其他账号（跳过正在限流冷却的）。
+    // 无 failover 配置时退化为单账号，行为与改动前一致。
+    const attempts: Array<{ id: string; label: string; store: CredentialStoreLike }> = []
+    if (options.failover !== undefined) {
+      const { selfId, candidates, registry } = options.failover
+      const all = candidates()
+      const self = all.find(c => c.id === selfId)
+      if (self !== undefined) attempts.push({ id: self.id, label: self.label, store: self.store })
+      for (const c of all) {
+        if (c.id === selfId) continue
+        if (registry.isLimited(c.id)) {
+          logger?.info(`workbuddy(${region}): 跳过限流中的账号 ${c.label}（${Math.ceil(registry.remainingMs(c.id) / 1000)}s 后重试）`)
+          continue
+        }
+        attempts.push({ id: c.id, label: c.label, store: c.store })
+      }
+    } else {
+      attempts.push({ id: '(self)', label: region, store })
     }
 
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    })
-    let sawDone = false
-    const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
-    body.on('data', (chunk: Buffer) => {
-      if (chunk.includes('[DONE]')) sawDone = true
-    })
-    body.on('error', (error: unknown) => {
-      logger?.warn(`workbuddy(${region}): upstream stream failed mid-flight`, error)
-      if (!sawDone && res.writable) res.end('data: [DONE]\n\n')
-    })
-    body.pipe(res)
+    let lastFailure: { status: number; kind: UpstreamErrorKind; message: string } | undefined
+    let limitedCount = 0
+
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i]!
+      let credential
+      try {
+        credential = await attempt.store.resolve()
+      } catch (error: unknown) {
+        // 该账号不可用（未登录/已删除/token 失效）：换下一个，不要因此打断整个请求
+        lastFailure = { status: 401, kind: 'session_dead', message: String(error instanceof Error ? error.message : error) }
+        if (attempts.length > 1) {
+          logger?.warn(`workbuddy(${region}): 账号 ${attempt.label} 不可用（${lastFailure.message.slice(0, 120)}），尝试下一个`)
+          continue
+        }
+        break
+      }
+
+      const result = await client.chatStream(credential, prepared, controller.signal)
+      if (result.ok) {
+        if (i > 0) {
+          logger?.info(`workbuddy(${region}): 已切换到账号 ${attempt.label} 完成本次请求（第 ${i + 1}/${attempts.length} 个）`)
+        }
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        })
+        let sawDone = false
+        const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
+        body.on('data', (chunk: Buffer) => {
+          if (chunk.includes('[DONE]')) sawDone = true
+        })
+        body.on('error', (error: unknown) => {
+          logger?.warn(`workbuddy(${region}): upstream stream failed mid-flight`, error)
+          if (!sawDone && res.writable) res.end('data: [DONE]\n\n')
+        })
+        body.pipe(res)
+        return
+      }
+
+      lastFailure = { status: result.status, kind: result.kind, message: result.message }
+
+      // 限流（额度暂时耗尽）：记下恢复时间，换同区域的下一个账号
+      if (result.kind === 'soft_rate' && options.failover !== undefined) {
+        const resetAtMs = parseRateLimitResetMs(result.message)
+        const until = options.failover.registry.mark(attempt.id, resetAtMs)
+        limitedCount++
+        const waitSec = Math.max(0, Math.ceil((until - Date.now()) / 1000))
+        logger?.warn(
+          `workbuddy(${region}): 账号 ${attempt.label} 触发频率限制，${waitSec}s 后恢复`
+          + (i + 1 < attempts.length ? '，切换到下一个账号' : '，已无可用账号'),
+        )
+        continue
+      }
+
+      // 其余错误：不再尝试其他账号（多为请求本身的问题，换号无益）
+      break
+    }
+
+    // 全部候选都失败：如实报错，并在文案里说明已尝试过切号
+    const failure = lastFailure ?? { status: 502, kind: 'server' as UpstreamErrorKind, message: 'no usable account' }
+    const tried = attempts.length
+    const suffix = limitedCount > 0
+      ? `（已尝试 ${tried} 个同区域账号，其中 ${limitedCount} 个因额度限流被跳过）`
+      : ''
+    writeOpenAIError(
+      res,
+      KIND_STATUS[failure.kind],
+      failure.kind,
+      `workbuddy upstream ${failure.kind} (http ${failure.status})${suffix}: ${failure.message.slice(0, 400)}`,
+    )
   }
 
   return {
