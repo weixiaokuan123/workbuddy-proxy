@@ -20,6 +20,7 @@ import { Readable } from 'node:stream'
 import type { WorkBuddyAuthStatus, WorkBuddyCredential } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
 import { parseRateLimitResetMs, prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+import { CreditCache } from './credit-cache.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { redactPaths } from './redact.ts'
 
@@ -220,6 +221,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   const { store, client, catalog, port, region, logger } = options
   const host = options.host ?? '127.0.0.1'
   const SHARED_SECRET = options.token ?? randomBytes(32).toString('base64url')
+  // 积分有 60s 缓存：面板轮询 /status 不会每次直打上游，上游抖动时用旧值兜底。
+  const creditCache = new CreditCache()
 
   function bearerOk(req: IncomingMessage): boolean {
     const header = req.headers.authorization
@@ -289,8 +292,13 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       if (req.method === 'GET' && (url === '/credits' || url === '/credits/')) {
         try {
           const credential = await store.resolve()
-          const credits = await options.client.fetchCredits(credential)
-          writeJson(res, 200, { region, ...credits })
+          const result = await creditCache.get(credential, c => options.client.fetchCredits(c))
+          writeJson(res, 200, {
+            region,
+            ...result.credits,
+            // 面板据此判断数据是否为缓存/降级值，便于显示「缓存于 N 秒前」。
+            cache: { cached: result.cached, stale: result.stale, ageSec: Math.round(result.ageMs / 1000) },
+          })
           return
         } catch (error) {
           writeOpenAIError(res, 502, 'credits_error', error instanceof Error ? error.message : String(error))
@@ -361,8 +369,14 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     if (auth.state === 'signed-in') {
       try {
         const credential = await store.resolve()
-        const credits = await client.fetchCredits(credential)
-        payload['credits'] = { total: credits.total, packages: credits.packages.length }
+        const result = await creditCache.get(credential, c => options.client.fetchCredits(c))
+        payload['credits'] = { total: result.credits.total, packages: result.credits.packages.length }
+        // 缓存元信息：面板可显示「N 秒前」或在降级时给出提示。
+        payload['creditsCache'] = {
+          cached: result.cached,
+          stale: result.stale,
+          ageSec: Math.round(result.ageMs / 1000),
+        }
       } catch (error: unknown) {
         payload['creditsError'] = String(error instanceof Error ? error.message : error)
       }
