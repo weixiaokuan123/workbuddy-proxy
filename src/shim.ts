@@ -116,6 +116,18 @@ export interface PoolEntryView {
   remainingSec: number
   /** 当前实际生效的账号（凭证解析成功时给出）。 */
   active: boolean
+  /** 该账号剩余积分；查不到时为 undefined（面板按「未知」显示）。 */
+  credits?: number
+  /** 积分包数量。 */
+  packages?: number
+  /** 积分是否来自缓存（未重新拉取）。 */
+  creditsCached?: boolean
+  /** 积分是否为上游失败后的降级旧值。 */
+  creditsStale?: boolean
+  /** 积分数据距今秒数。 */
+  creditsAgeSec?: number
+  /** 积分查询失败时的原因（该条目不因此消失）。 */
+  creditsError?: string
 }
 
 export interface WorkBuddyShimOptions {
@@ -336,22 +348,35 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       const { selfId, candidates, registry } = options.failover
       const all = candidates()
       const limited = registry.snapshot()
-      // 池化视图：面板据此显示「这个入口背后有几个号、当前轮到谁、谁在冷却」。
-      payload['pool'] = {
-        size: all.length,
-        preferredId: selfId,
-        entries: all.map((c): PoolEntryView => {
-          const remainingMs = registry.remainingMs(c.id)
+      // 池化视图：面板据此显示「这个入口背后有几个号、当前轮到谁、谁在冷却、各自多少积分」。
+      // 积分查询并发进行，共用 creditCache（按 domain+uid 分区，TTL 内不会重复打上游）；
+      // 单个账号查失败只在该条目上留 creditsError，不影响整个 /status。
+      const entries = await Promise.all(all.map(async (c): Promise<PoolEntryView> => {
+        const remainingMs = registry.remainingMs(c.id)
+        const base: PoolEntryView = {
+          id: c.id,
+          label: c.label,
+          preferred: c.id === selfId,
+          rateLimited: remainingMs > 0,
+          remainingSec: Math.ceil(remainingMs / 1000),
+          active: false,
+        }
+        try {
+          const credential = await c.store.resolve()
+          const result = await creditCache.get(credential, cred => options.client.fetchCredits(cred))
           return {
-            id: c.id,
-            label: c.label,
-            preferred: c.id === selfId,
-            rateLimited: remainingMs > 0,
-            remainingSec: Math.ceil(remainingMs / 1000),
-            active: false,
+            ...base,
+            credits: result.credits.total,
+            packages: result.credits.packages.length,
+            creditsCached: result.cached,
+            creditsStale: result.stale,
+            creditsAgeSec: Math.round(result.ageMs / 1000),
           }
-        }),
-      }
+        } catch (error: unknown) {
+          return { ...base, creditsError: error instanceof Error ? error.message : String(error) }
+        }
+      }))
+      payload['pool'] = { size: all.length, preferredId: selfId, entries }
       payload['failover'] = {
         enabled: true,
         candidates: all.length,
@@ -360,11 +385,29 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     } else {
       // 即使只有一个候选（如国际版目前只有 1 个账号），也把池视图暴露出来，
       // 面板才能一致地显示「该区域目前就 1 个号」；以后加号时视图自动扩展。
-      payload['pool'] = {
-        size: 1,
-        preferredId: `live-${region}`,
-        entries: [{ id: `live-${region}`, label: `${region}·当前登录`, preferred: true, rateLimited: false, remainingSec: 0, active: false }],
+      // 积分同样走 creditCache（与下方 credits 字段共用，所以不会多打一次上游）。
+      const entry: PoolEntryView = {
+        id: `live-${region}`,
+        label: `${region}·当前登录`,
+        preferred: true,
+        rateLimited: false,
+        remainingSec: 0,
+        active: false,
       }
+      if (auth.state === 'signed-in') {
+        try {
+          const credential = await store.resolve()
+          const result = await creditCache.get(credential, c => options.client.fetchCredits(c))
+          entry.credits = result.credits.total
+          entry.packages = result.credits.packages.length
+          entry.creditsCached = result.cached
+          entry.creditsStale = result.stale
+          entry.creditsAgeSec = Math.round(result.ageMs / 1000)
+        } catch (error: unknown) {
+          entry.creditsError = error instanceof Error ? error.message : String(error)
+        }
+      }
+      payload['pool'] = { size: 1, preferredId: `live-${region}`, entries: [entry] }
     }
     if (auth.state === 'signed-in') {
       try {
