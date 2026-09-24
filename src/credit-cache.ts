@@ -48,9 +48,35 @@ export class CreditCache {
   private readonly entries = new Map<string, Entry>()
   private readonly inflight = new Map<string, Promise<WorkBuddyCredits>>()
   private readonly now: () => number
+  private readonly maxConcurrent: number
+  private running = 0
+  /** 等待并发名额的排队者（FIFO）。 */
+  private readonly waiters: Array<() => void> = []
 
-  constructor(now: () => number = () => Date.now()) {
+  constructor(
+    now: () => number = () => Date.now(),
+    /** 同时进行的上游积分请求上限，防止池变大后瞬间打爆上游。 */
+    maxConcurrent = 3,
+  ) {
     this.now = now
+    this.maxConcurrent = Math.max(1, maxConcurrent)
+  }
+
+  /** 取一个并发名额（无空位则排队）。 */
+  private async acquire(): Promise<void> {
+    if (this.running < this.maxConcurrent) {
+      this.running++
+      return
+    }
+    await new Promise<void>(resolve => this.waiters.push(resolve))
+    this.running++
+  }
+
+  /** 归还并发名额，唤醒下一个排队者。 */
+  private release(): void {
+    this.running--
+    const next = this.waiters.shift()
+    if (next !== undefined) next()
   }
 
   /**
@@ -89,12 +115,14 @@ export class CreditCache {
     const existing = this.inflight.get(key)
     if (existing !== undefined) return existing
 
-    const task = loader(credential)
+    const task = this.acquire()
+      .then(() => loader(credential))
       .then(credits => {
         this.entries.set(key, { credits, fetchedAtMs: this.now() })
         return credits
       })
       .finally(() => {
+        this.release()
         this.inflight.delete(key)
       })
     this.inflight.set(key, task)

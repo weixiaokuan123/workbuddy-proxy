@@ -143,3 +143,36 @@ test('clear() 后强制重新拉取', async () => {
   await cache.get(cred('u1'), async () => { calls++; return credits(2) })
   assert.equal(calls, 2)
 })
+
+test('并发上限生效：不同账号同时请求不会同时超过 maxConcurrent', async () => {
+  const cache = new CreditCache(() => 0, 2) // 最多 2 个并发
+  let concurrent = 0
+  let peak = 0
+  const loader = async () => {
+    concurrent++
+    peak = Math.max(peak, concurrent)
+    await new Promise(r => setTimeout(r, 20))
+    concurrent--
+    return credits(1)
+  }
+  await Promise.all([
+    cache.get(cred('a'), loader),
+    cache.get(cred('b'), loader),
+    cache.get(cred('c'), loader),
+    cache.get(cred('d'), loader),
+    cache.get(cred('e'), loader),
+  ])
+  assert.ok(peak <= 2, `峰值并发 ${peak} 超过上限 2`)
+  assert.ok(peak >= 1)
+})
+
+test('排队者在上游抛错后仍能继续（名额不泄漏）', async () => {
+  const cache = new CreditCache(() => 0, 1)
+  const results = await Promise.allSettled([
+    cache.get(cred('bad'), async () => { throw new Error('boom') }),
+    cache.get(cred('good'), async () => credits(9)),
+  ])
+  assert.equal(results[0]?.status, 'rejected')
+  assert.equal(results[1]?.status, 'fulfilled')
+  assert.equal((results[1] as PromiseFulfilledResult<{ credits: WorkBuddyCredits }>).value.credits.total, 9)
+})

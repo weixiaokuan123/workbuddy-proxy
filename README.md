@@ -207,10 +207,32 @@ curl -H "Authorization: Bearer $KEY" http://127.0.0.1:39301/status
 查看池状态：
 
 ```powershell
-# /status 的 pool 字段：池大小、每个账号是否冷却、谁是首选
+# /status 的 pool 字段：池大小、每个账号的积分、是否冷却、谁是首选
 $key = (Get-Content keys\cn.key -Raw).Trim()
 Invoke-RestMethod http://127.0.0.1:39301/status -Headers @{ Authorization = "Bearer $key" } | ConvertTo-Json -Depth 8
 ```
+
+每个池条目除冷却状态外，还带该账号的积分：
+
+```jsonc
+"pool": {
+  "size": 3,
+  "preferredId": "live-cn",
+  "entries": [
+    { "id": "live-cn", "label": "cn·当前登录", "preferred": true, "rateLimited": false,
+      "remainingSec": 0, "active": false, "credits": 2069, "packages": 10,
+      "creditsCached": true, "creditsStale": false, "creditsAgeSec": 3 },
+    { "id": "acct:switch:…", "label": "cn·什么铁环", "preferred": false, "rateLimited": false,
+      "remainingSec": 0, "active": false, "credits": 1382, "packages": 20 },
+    { "id": "acct:switch:…", "label": "cn·18180938113", "preferred": false, "rateLimited": false,
+      "remainingSec": 0, "active": false, "credits": 2071, "packages": 4 }
+  ]
+}
+```
+
+- 积分查询带 **60 秒缓存**（按账号身份分区），面板高频轮询不会反复打上游；
+  上游抖动时回退 15 分钟内的旧值并置 `creditsStale: true`。
+- 某个账号积分查不到时，该条目给 `creditsError`，**不影响整个 `/status`**，也不影响它在池中的可用性。
 
 ## 限额用尽自动换号
 
@@ -235,11 +257,12 @@ Invoke-RestMethod http://127.0.0.1:39301/status -Headers @{ Authorization = "Bea
 查看当前哪些账号处于限流冷却：
 
 ```powershell
-# /status 带 pool（池视图）与 failover（旧字段，保留兼容）
+# /status 带 pool（池视图，含每个账号的积分）与 failover（旧字段，保留兼容）
 curl -H "Authorization: Bearer <该端口的 key>" http://127.0.0.1:39301/status
-# → "pool": { "size": 4, "preferredId": "live-cn",
-#             "entries": [ { "id": "live-cn", "label": "cn·当前登录", "preferred": true, "rateLimited": false, "remainingSec": 0 }, … ] }
-# → "failover": { "enabled": true, "candidates": 4, "rateLimited": [ { "id": "acct:…", "remainingSec": 1234 } ] }
+# → "pool": { "size": 3, "preferredId": "live-cn",
+#             "entries": [ { "id": "live-cn", "label": "cn·当前登录", "preferred": true,
+#                            "rateLimited": false, "remainingSec": 0, "credits": 2069, "packages": 10 }, … ] }
+# → "failover": { "enabled": true, "candidates": 3, "rateLimited": [ { "id": "acct:…", "remainingSec": 1234 } ] }
 ```
 
 > 区域内只有一个账号时不会启用切换，`"failover"` 字段缺失、`pool.size` 为 1。
@@ -274,9 +297,9 @@ workbuddy-proxy/
     status.ps1             查询两区域登录/积分/模型数
     install-autostart.ps1  注册登录时自启的计划任务
     uninstall-autostart.ps1 取消自启
-    inject-config.cjs      把两个 provider 注入 opencode.jsonc（自动备份）
+    inject-config.cjs      兼容入口，转调 sync-opencode-config.mjs
     sync-opencode-config.mjs 按账号库/实时模型目录同步 workbuddy-* provider
-    verify-config.cjs      校验注入结果（不打印 key 明文）
+    verify-config.cjs      只读校验配置结构（不打印 key 明文，查 acct 块残留）
   src/
     auth.ts                只读桌面端登录态、内存内 token 刷新
     accounts.ts            多账号库（兼容 workbuddy-switch 格式）+ live 去重
