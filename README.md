@@ -11,8 +11,8 @@
 
 > **两点须知**
 > 1. 本项目**参考 [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) 改写**，只保留其纯 Node 连接内核。
-> 2. 本代理**不能切换账号**，只使用当前登录的账号；如需切换请配合
->    **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)**。详见「不支持切换账号」一节。
+> 2. 本代理**内置多账号 + 自动切换**：opencode 侧只需国内/国际两个入口，
+>    撞限流会自动换到同区域的其他账号。详见「多账号与自动切换」一节。
 
 ## 来源
 
@@ -25,29 +25,62 @@ WorkBuddy 的登录模型接到 DSH 上。其设计又源自
 改造点：**去掉 DSH 插件外壳，只保留纯 Node 连接内核**，做成 opencode 侧的独立 OpenAI 兼容代理，
 并刻意简化了账号处理逻辑（见下一节）。模型目录、上游协议映射、token 刷新等核心逻辑均沿用原项目。
 
-## 不支持切换账号：请配合 workbuddy-switch 使用
+## 多账号与自动切换（v1.3.1 起的默认形态）
 
-**本代理本身不具备、也不打算提供账号切换能力。** 它被刻意设计成「只读当前登录态」：
+本代理**自带多账号池 + 限流自动切换**，不依赖任何外部 switch App。
 
-- 每次请求都**实时重读**对应区域的 live 认证文件（国内 `workbuddy-desktop.info`，国际 `workbuddy-desktop-ai.info`），无缓存、无 mtime/hash 门禁；
-- **不做多账号选择、不做 selected 锁定、不扫描历史时间戳备份**；
-- token 刷新结果**只存在进程内存**，绝不写回桌面端文件、不落地任何副本。
+- **账号库**：`state/accounts.json`（含 token，已 gitignore，绝不入库），可直接导入
+  [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 的 `~/.wb-switch/accounts.json`。
+- **单一入口**：opencode 侧只有两个 provider —— 国内版 `127.0.0.1:39301`、
+  国际版 `127.0.0.1:39302`。每个入口背后是**该区域的全部账号**（live 登录态 + 账号库）。
+- **自动切换**：某账号撞限流（`code:6004`）时，代理在**同一次请求内**自动换到同区域
+  的下一个可用账号，请求照常完成；你不需要知道背后换了谁。
+- **冷却记忆**：被限流的账号会记下恢复时间（从「将在 … 重置」里解析），期间排在候选末尾；
+  恢复后**自动重新参与**，无需手动干预。
+- **自动恢复首选**：每次请求都重新计算顺序，本端口的 live 账号优先，所以限流解除后
+  下次就自动回到你自己的账号。
+- **不碰官方 live 文件**：账号库的 token 只存代理库；刷新结果也只写回库。
 
-因此，**切换账号必须依赖第三方工具**：
+> v1.3.0 及更早：账号库**每个账号单独一个端口**（39320+），opencode 侧是多 provider。
+> 该模式已改为默认关闭，如需单独调试某账号可设 `WORKBUDDY_ACCOUNT_PORTS=on` 恢复。
 
-> **[changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)** —— WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri，MIT）。
+### 管理账号
 
-workbuddy-switch 负责把目标账号写入 live 认证文件；本代理在下一次请求时自动跟随。
-**不装它就只能用当前已登录的那一个账号。**
+```powershell
+# 列出账号库（含 token 剩余时间）
+node scripts\accounts.cjs list
 
-使用流程：
+# 收录当前 WorkBuddy 登录态为新账号（替代「扫码加账号」）
+# 用法：先在 WorkBuddy 里登录目标账号，然后执行：
+node scripts\accounts.cjs capture
 
-1. 用 [workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 切换到想用的账号；
-2. 无需重启本代理，下一次对话请求即使用新账号；
-3. 若切号后立刻报 401，检查是否两个区域（国内/国际）的账号串了——本代理会校验 `domain` 与端口是否匹配。
+# 删除账号
+node scripts\accounts.cjs remove <key>
+```
 
-> 之所以这样设计：账号切换涉及备份/关闭桌面端/写入/重启等重操作，且要处理多账号密钥存储，
-> 交给专门的工具更稳妥；本代理保持无状态、可随时跟随，避免账号状态两处维护而互相打架。
+改完账号后同步 opencode 配置（见下节），无需手改 provider。
+
+### 同步 opencode 配置
+
+opencode 侧的 `workbuddy-*` provider 块由脚本生成，**不需要手写**：
+
+```powershell
+# 按当前账号库与实时模型目录刷新 opencode.jsonc（幂等）
+node scripts\sync-opencode-config.mjs
+
+# 只看会改什么，不落盘
+node scripts\sync-opencode-config.mjs --dry-run
+
+# CI/自检：不一致时退出码 2
+node scripts\sync-opencode-config.mjs --check
+```
+
+脚本**只重写 key 以 `workbuddy-` 开头的 provider 块**，并清除历史遗留的
+`workbuddy-acctN` 块；其余 provider（trae / minimax / 其他）字节级原样保留，
+不丢注释、不改缩进。
+
+> 账号加号/删号后：先跑同步脚本，再重启 opencode 让配置生效。
+> 代理**不需要**重启（账号库在每次请求时实时读取）。
 
 ## 运行要求
 
@@ -148,54 +181,36 @@ curl -H "Authorization: Bearer $KEY" http://127.0.0.1:39301/status
 | `WORKBUDDY_CN_AUTH_FILE` | 平台默认 | 国内登录态文件路径 |
 | `WORKBUDDY_GLOBAL_AUTH_FILE` | 平台默认 | 国际登录态文件路径 |
 | `WORKBUDDY_AUTH_FILE` | 无 | 兼容旧版单变量（区域专属变量优先） |
+| `WORKBUDDY_ACCOUNT_PORTS` | `off` | `on` 时为账号库每个账号单独开端口（39320+），仅供调试 |
+| `WORKBUDDY_ACCOUNT_PORT_BASE` | `39320` | 调试端口的起始端口 |
 | `OPENCODE_CONFIG_DIR` | `~/.config/opencode` | opencode 配置目录（注入/验证脚本使用） |
 
 ## 多账号（内置，可替代 workbuddy-switch）
 
-本代理**自带多账号能力**，不依赖外部 switch App。
+本代理**自带多账号池 + 限流自动切换**，不依赖外部 switch App。
+完整说明见上文「多账号与自动切换」一节；此处补充运维细节。
 
 - **账号库**：`state/accounts.json`（含 token，已 gitignore，绝不入库）。
-- **每个账号一个端口**：第 i 个账号监听 `39320 + i`，opencode 侧自动生成对应 provider，
-  **多个账号可同时使用、并行跑任务**——这是「切换式」工具做不到的。
+- **默认不单独开端口**：账号库账号并入 `39301`/`39302` 的候选池，
+  opencode 侧只有两个 provider。撞限流在池内自动换号。
 - **不碰官方 live 文件**：账号的 token 只存代理库；刷新结果也只写回库。
   因此**无需关闭 WorkBuddy 桌面端**，也不会与客户端互相打架。
+- 每个账号**独立随机签到**（07:00–10:00 各自随机），池化后依然逐个执行，互不影响。
 
-### 管理账号
-
-```powershell
-# 列出账号库（含 token 剩余时间、对应端口）
-node scripts\accounts.cjs list
-
-# 从 workbuddy-switch 导入（已装 switch 时零迁移成本）
-node scripts\accounts.cjs import-switch
-
-# 收录当前 WorkBuddy 登录态为新账号（替代「扫码加账号」）
-# 用法：先在 WorkBuddy 里登录目标账号，然后执行：
-node scripts\accounts.cjs capture cn
-
-# 删除账号
-node scripts\accounts.cjs remove <key>
-```
-
-改完账号后重新注入 provider 并重启 opencode：
-
-```powershell
-node scripts\inject-config.cjs
-```
-
-端口分配（`src/serve.ts` 的 `ACCOUNT_PORT_BASE`，默认 39320）：
+端口分配：
 
 | 端口 | 用途 |
 | --- | --- |
-| 39301 / 39302 | 跟随官方当前登录态（live 模式）|
-| 39320 | 账号库第 0 个账号 |
-| 39321 | 账号库第 1 个账号 |
-| … | 以此类推 |
+| 39301 / 39302 | 跟随官方当前登录态（live），并承载该区域全部候选账号 |
+| 39320 + i | 仅当 `WORKBUDDY_ACCOUNT_PORTS=on` 时，账号库第 i 个账号独立端口 |
 
-每个账号**独立随机签到**（07:00–10:00 各自随机），互不影响。
+查看池状态：
 
-> 关于加新账号：本代理不内嵌 OAuth 扫码流程（那是登录态最脆弱的部分）。
-> 加账号只需「在 WorkBuddy 里登录一次 + `capture` 一下」，比扫码更简单。
+```powershell
+# /status 的 pool 字段：池大小、每个账号是否冷却、谁是首选
+$key = (Get-Content keys\cn.key -Raw).Trim()
+Invoke-RestMethod http://127.0.0.1:39301/status -Headers @{ Authorization = "Bearer $key" } | ConvertTo-Json -Depth 8
+```
 
 ## 限额用尽自动换号
 
@@ -210,9 +225,9 @@ node scripts\inject-config.cjs
 - **触发条件**：业务码 `6004`、HTTP `429`，或文案含「频率限制 / 超出频率 / too many requests」。
   注意上游有时用 **HTTP 200 + 错误信封**返回它，代理也能识别。
 - **切换范围**：同一区域（cn / global）内的全部账号，包括 live 登录态与账号库里的账号。
-  当前端口的账号优先，其余按顺序尝试。
+  本端口对应的 live 账号优先；其余可用户账号按**最早恢复**排序，冷却中的排末尾。
 - **记忆冷却**：被限流的账号会记下恢复时间（从「将在 … 重置」里解析），
-  在恢复前**所有端口都会跳过它**；解析不到时间则固定冷却 10 分钟。
+  在恢复前**排在候选末尾**；解析不到时间则固定冷却 10 分钟。
 - **全部用尽才报错**：报错文案会注明「已尝试 N 个同区域账号，其中 M 个因额度限流被跳过」。
 - **不误伤真正的问题**：额度**永久**不足（积分不足 / HTTP 402）、请求本身不合法等，
   不会被当成限流去换号，仍是直接报错。单账号用户行为完全不变。
@@ -220,12 +235,15 @@ node scripts\inject-config.cjs
 查看当前哪些账号处于限流冷却：
 
 ```powershell
-# 任意端口的 /status 都会带 failover 字段
+# /status 带 pool（池视图）与 failover（旧字段，保留兼容）
 curl -H "Authorization: Bearer <该端口的 key>" http://127.0.0.1:39301/status
-# → "failover": { "enabled": true, "candidates": 3, "rateLimited": [ { "id": "acct:...", "remainingSec": 1234 } ] }
+# → "pool": { "size": 4, "preferredId": "live-cn",
+#             "entries": [ { "id": "live-cn", "label": "cn·当前登录", "preferred": true, "rateLimited": false, "remainingSec": 0 }, … ] }
+# → "failover": { "enabled": true, "candidates": 4, "rateLimited": [ { "id": "acct:…", "remainingSec": 1234 } ] }
 ```
 
-> 单账号端口（如同一区域只有一个账号）不会启用切换，返回 `"failover"` 字段缺失。
+> 区域内只有一个账号时不会启用切换，`"failover"` 字段缺失、`pool.size` 为 1。
+> 等到该区域有第二个账号（加号或导入）后，切换自动生效，无需改配置。
 
 ## 每日自动签到
 
@@ -257,24 +275,26 @@ workbuddy-proxy/
     install-autostart.ps1  注册登录时自启的计划任务
     uninstall-autostart.ps1 取消自启
     inject-config.cjs      把两个 provider 注入 opencode.jsonc（自动备份）
+    sync-opencode-config.mjs 按账号库/实时模型目录同步 workbuddy-* provider
     verify-config.cjs      校验注入结果（不打印 key 明文）
   src/
     auth.ts                只读桌面端登录态、内存内 token 刷新
-    accounts.ts            多账号库（兼容 workbuddy-switch 格式）
+    accounts.ts            多账号库（兼容 workbuddy-switch 格式）+ live 去重
     account-store.ts       账号库凭据 store（刷新写回库）
     catalog.ts             模型目录（静态 fallback + 上游刷新）
-    serve.ts               守护入口（双区域 + 每账号一端口）
+    serve.ts               守护入口（双区域池化入口 + 可选调试端口）
     shim.ts                OpenAI 兼容回环端点（含限额自动换号）
     upstream.ts            上游网关客户端与协议映射
     version.ts             版本常量
   test/
     failover.test.ts       限额换号模拟测试（无需网络、不耗额度）
+    pool.test.ts           池化切换与账号去重测试
 ```
 
 运行测试（无副作用，不消耗任何账号额度）：
 
 ```powershell
-node --test test/failover.test.ts
+node --test test/failover.test.ts test/pool.test.ts
 ```
 
 ## 排错
@@ -282,13 +302,16 @@ node --test test/failover.test.ts
 | 现象 | 处理 |
 | --- | --- |
 | `/status` 显示 `signed-out` | 先在对应区域登录 WorkBuddy 桌面端；或检查 `WORKBUDDY_*_AUTH_FILE` 指向 |
-| **想换账号** | 用 `node scripts\accounts.cjs list` 查看；账号库见下方「多账号」。多个账号建议都注册为独立 provider 并行使用 |
+| **想换账号** | 默认自动切换，无需手动操作。想单独调试某账号：`WORKBUDDY_ACCOUNT_PORTS=on` 后重启，端口 `39320+` |
+| 加了账号但 opencode 里没有 | 跑 `node scripts\sync-opencode-config.mjs`，再重启 opencode |
+| opencode 里还有「账号A/B/C/D」 | 那是遗留的 `workbuddy-acctN` provider，跑同步脚本会自动清除 |
 | 切号后立刻 401 | 两个区域的账号串了，检查国内/国际 live 文件是否对调 |
 | 端口未监听 | 查看 `logs\proxy.err.log`；确认 Node 为 22.19+/24+ |
 | 报 `domain 区域不符` | 该端口收到了另一区域的账号，检查两个登录态文件是否串了 |
-| 报错含「已尝试 N 个同区域账号」 | 该区域所有账号额度都已用尽（或都被限流）。查看 `/status` 的 `failover.rateLimited` 得知各自恢复时间 |
-| 某账号一直不被使用 | 它可能仍在限流冷却中，见 `/status` 的 `failover.rateLimited` |
-| opencode 里看不到新模型 | 重启 opencode；再跑 `verify-config.cjs` 确认注入成功 |
+| 报错含「已尝试 N 个同区域账号」 | 该区域所有账号额度都已用尽（或都被限流）。查看 `/status` 的 `pool.entries` 得知各自恢复时间 |
+| 某账号一直不被使用 | 它可能仍在限流冷却中，见 `/status` 的 `pool.entries[].rateLimited` |
+| 账号库里的账号没进池子 | 它可能与 live 当前登录态是同一个号，启动日志会写「已从切换池剔除」 |
+| opencode 里看不到新模型 | 跑同步脚本；重启 opencode 确认配置生效 |
 | `.ps1` 中文乱码 | 跑 `node add-bom.cjs` 补 BOM |
 
 ## 许可

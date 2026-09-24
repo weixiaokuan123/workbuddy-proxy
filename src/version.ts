@@ -5,4 +5,4 @@
  * 的纯 Node 连接内核；原版版本在构建期注入，独立版改为直接常量。
  */
 
-export const WORKBUDDY_CONNECT_VERSION = '1.3.0'
+export const WORKBUDDY_CONNECT_VERSION = '1.3.1'

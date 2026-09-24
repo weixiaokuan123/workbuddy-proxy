@@ -96,6 +96,56 @@ export function toCredential(account: StoredAccount): WorkBuddyCredential {
   }
 }
 
+/**
+ * 去除「与 live 登录态是同一个账号」的库记录。
+ *
+ * 场景：`state/accounts.json` 由 workbuddy-switch 导入，可能包含当前官方客户端
+ * 正在登录的那个账号。若不去重，池化入口会把同一个账号算作两个候选，
+ * 既浪费切换机会（撞限流后"换号"其实还换到自己），又会让面板把余额算两遍。
+ *
+ * 判定优先级：uid 完全相同 > (domain + account/uin) 相同。
+ * live 凭证优先保留（token 最新鲜），库中重复项被剔除。
+ *
+ * @param liveKeys  live 登录态的判定键集合（由 `identityKeysOf` 生成）
+ * @param accounts 账号库记录
+ */
+export function dropLiveDuplicates(
+  liveKeys: ReadonlySet<string>,
+  accounts: readonly StoredAccount[],
+): StoredAccount[] {
+  if (liveKeys.size === 0) return [...accounts]
+  return accounts.filter(a => {
+    for (const key of identityKeysOfRecord(a)) {
+      if (liveKeys.has(key)) return false
+    }
+    return true
+  })
+}
+
+/**
+ * 生成一条库记录的账号身份键（可能多个，用于宽松比对）。
+ * `uid` 是权威主键；`domain:account` 用于 uid 缺失时兜底。
+ */
+export function identityKeysOfRecord(a: Pick<StoredAccount, 'region' | 'uid' | 'domain' | 'label' | 'nickname' | 'uin'>): string[] {
+  const keys: string[] = []
+  if (a.uid !== '') keys.push(`${a.region}:uid:${a.uid}`)
+  const name = a.uin ?? a.nickname ?? a.label
+  if (name !== undefined && name !== '') keys.push(`${a.region}:name:${name}`)
+  return keys
+}
+
+/** 生成 live 凭证的账号身份键；与 `identityKeysOfRecord` 同构，可直接比较。 */
+export function identityKeysOfCredential(
+  region: WorkBuddyRegion,
+  c: Pick<WorkBuddyCredential, 'uid' | 'nickname' | 'uin'>,
+): string[] {
+  const keys: string[] = []
+  if (c.uid !== undefined && c.uid !== '') keys.push(`${region}:uid:${c.uid}`)
+  const name = c.uin ?? c.nickname
+  if (name !== undefined && name !== '') keys.push(`${region}:name:${name}`)
+  return keys
+}
+
 /** workbuddy-switch accounts.json 的单条记录形态（宽松）。 */
 interface SwitchAccount {
   id?: unknown

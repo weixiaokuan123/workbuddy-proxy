@@ -103,6 +103,20 @@ export interface WorkBuddyShim {
   close(): Promise<void>
 }
 
+/** 池化入口暴露给面板的单个候选账号状态。 */
+export interface PoolEntryView {
+  id: string
+  label: string
+  /** 是否为本端口绑定的主账号（正常情况下优先使用）。 */
+  preferred: boolean
+  /** 是否处于限流冷却中。 */
+  rateLimited: boolean
+  /** 距离恢复的秒数（0 表示可用）。 */
+  remainingSec: number
+  /** 当前实际生效的账号（凭证解析成功时给出）。 */
+  active: boolean
+}
+
 export interface WorkBuddyShimOptions {
   region: 'cn' | 'global'
   port: number
@@ -311,11 +325,37 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     const auth = await store.status()
     const payload: Record<string, unknown> = { region, auth, models: catalog.current().length }
     if (options.failover !== undefined) {
-      const limited = options.failover.registry.snapshot()
+      const { selfId, candidates, registry } = options.failover
+      const all = candidates()
+      const limited = registry.snapshot()
+      // 池化视图：面板据此显示「这个入口背后有几个号、当前轮到谁、谁在冷却」。
+      payload['pool'] = {
+        size: all.length,
+        preferredId: selfId,
+        entries: all.map((c): PoolEntryView => {
+          const remainingMs = registry.remainingMs(c.id)
+          return {
+            id: c.id,
+            label: c.label,
+            preferred: c.id === selfId,
+            rateLimited: remainingMs > 0,
+            remainingSec: Math.ceil(remainingMs / 1000),
+            active: false,
+          }
+        }),
+      }
       payload['failover'] = {
         enabled: true,
-        candidates: options.failover.candidates().length,
+        candidates: all.length,
         rateLimited: limited.map(l => ({ id: l.id, remainingSec: Math.ceil(l.remainingMs / 1000) })),
+      }
+    } else {
+      // 即使只有一个候选（如国际版目前只有 1 个账号），也把池视图暴露出来，
+      // 面板才能一致地显示「该区域目前就 1 个号」；以后加号时视图自动扩展。
+      payload['pool'] = {
+        size: 1,
+        preferredId: `live-${region}`,
+        entries: [{ id: `live-${region}`, label: `${region}·当前登录`, preferred: true, rateLimited: false, remainingSec: 0, active: false }],
       }
     }
     if (auth.state === 'signed-in') {
@@ -342,21 +382,35 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     const controller = new AbortController()
     req.on('close', () => controller.abort())
 
-    // 尝试顺序：本端口的 store 优先，其后是同区域其他账号（跳过正在限流冷却的）。
+    // 候选池：本端口主账号优先，其余按「最早恢复」排序，冷却中的排最后。
     // 无 failover 配置时退化为单账号，行为与改动前一致。
+    //
+    // 为什么冷却中的账号仍保留在池里：若同区域所有账号都在冷却，直接报错
+    // 不如尝试最早恢复的那个 —— 上游冷却时间可能早于本地估算（时钟偏差/
+    // 误判），硬等反而不如再试一次。真正的错误由最后一轮如实抛出。
     const attempts: Array<{ id: string; label: string; store: CredentialStoreLike }> = []
     if (options.failover !== undefined) {
       const { selfId, candidates, registry } = options.failover
       const all = candidates()
       const self = all.find(c => c.id === selfId)
       if (self !== undefined) attempts.push({ id: self.id, label: self.label, store: self.store })
-      for (const c of all) {
-        if (c.id === selfId) continue
-        if (registry.isLimited(c.id)) {
-          logger?.info(`workbuddy(${region}): 跳过限流中的账号 ${c.label}（${Math.ceil(registry.remainingMs(c.id) / 1000)}s 后重试）`)
-          continue
-        }
-        attempts.push({ id: c.id, label: c.label, store: c.store })
+
+      const rest = all
+        .filter(c => c.id !== selfId)
+        .map(c => ({ candidate: c, limited: registry.isLimited(c.id), remaining: registry.remainingMs(c.id) }))
+        // 可用账号在前；都可用按顺序稳定排序，冷却中的按剩余时间升序
+        .sort((a, b) => {
+          if (a.limited !== b.limited) return a.limited ? 1 : -1
+          return a.remaining - b.remaining
+        })
+      for (const r of rest) attempts.push({ id: r.candidate.id, label: r.candidate.label, store: r.candidate.store })
+
+      const dodging = rest.filter(r => r.limited)
+      if (dodging.length > 0) {
+        logger?.info(
+          `workbuddy(${region}): 候选池 ${all.length} 个账号，其中 ${dodging.length} 个冷却中`
+          + `（${dodging.map(r => `${r.candidate.label} ${Math.ceil(r.remaining / 1000)}s`).join('、')}），已排在末尾`,
+        )
       }
     } else {
       attempts.push({ id: '(self)', label: region, store })

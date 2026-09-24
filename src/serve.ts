@@ -13,9 +13,9 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LiveCredentialStore } from './auth.ts'
 import { AccountCredentialStore } from './account-store.ts'
-import { AccountStore, regionOfDomain, type StoredAccount } from './accounts.ts'
+import { AccountStore, dropLiveDuplicates, identityKeysOfCredential, regionOfDomain, type StoredAccount } from './accounts.ts'
 import { WorkBuddyCatalog } from './catalog.ts'
-import { createWorkBuddyShim, RateLimitRegistry, type WorkBuddyShim, type ShimLogger } from './shim.ts'
+import { createWorkBuddyShim, RateLimitRegistry, type CredentialStoreLike, type WorkBuddyShim, type ShimLogger } from './shim.ts'
 import { WorkBuddyUpstreamClient, type WorkBuddyRegion } from './upstream.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { WorkBuddySigninService } from './signin.ts'
@@ -36,6 +36,15 @@ const SIGNIN_INITIAL_DELAY_MS = 60 * 1000
 /** 账号模式端口段：账号 i 使用 BASE + i（39320 起）。 */
 const ACCOUNT_PORT_BASE = Number(process.env['WORKBUDDY_ACCOUNT_PORT_BASE'] ?? 39320)
 
+/**
+ * 是否为账号库的每个账号单独开一个回环端口。
+ *
+ * 默认 **off**：账号库不再单独开端口，而是并入 live 端口（39301/39302）的
+ * 候选池 —— opencode 侧只需国内/国际两个 provider，撞限流时池内自动换号。
+ * 置 on 可恢复旧行为（每账号一端口），仅用于单独调试某个账号。
+ */
+const ACCOUNT_PORTS_ENABLED = (process.env['WORKBUDDY_ACCOUNT_PORTS'] ?? 'off') !== 'off'
+
 interface RegionRuntime {
   /** 运行时标识：live-cn / live-global / acct:<key> */
   id: string
@@ -50,6 +59,11 @@ interface RegionRuntime {
   scheduler: SigninScheduler
   /** 账号模式下记录账号 key，用于签到调度命名 */
   accountKey?: string
+  /**
+   * 该运行时切换池内的账号库账号（live 端口用）。
+   * 空数组表示池里只有 live 自己，退化为单账号行为。
+   */
+  pool: Array<{ id: string; label: string; store: AccountCredentialStore }>
   shim?: WorkBuddyShim
 }
 
@@ -114,7 +128,51 @@ async function main(): Promise<void> {
   const runtimes: RegionRuntime[] = []
   const accounts = new AccountStore(ACCOUNTS_FILE)
 
-  // ---- 模式 1：跟随官方 live 登录态（原有行为，端口 39301/39302）----
+  // ---- 账号库加载 + 与 live 去重 ----
+  // 账号库是池化切换的唯一数据源。与 live 当前登录态重复的账号会被剔除，
+  // 避免"换号换到自己"以及面板重复计余额。
+  const storedAll: StoredAccount[] = await accounts.load()
+  const liveIds = new Map<WorkBuddyRegion, Set<string>>()
+  if ((process.env['WORKBUDDY_LIVE_MODE'] ?? 'on') !== 'off') {
+    for (const region of (['cn', 'global'] as WorkBuddyRegion[])) {
+      try {
+        const store = new LiveCredentialStore({ region, refresh: credential => client.refreshToken(credential) })
+        const credential = await store.resolve()
+        liveIds.set(region, new Set(identityKeysOfCredential(region, credential)))
+      } catch {
+        // 未登录：该区域没有 live 身份，无需去重
+      }
+    }
+  }
+  const stored = ACCOUNT_PORTS_ENABLED
+    ? storedAll // 调试模式：保留全部账号（每号一端口，需要独立身份）
+    : dropLiveDuplicates(
+        // 把每个区域的 live 身份键合并成一个集合即可：键里带 region 前缀，不会跨区误判
+        new Set([...liveIds.values()].flatMap(s => [...s])),
+        storedAll,
+      )
+  const dropped = storedAll.length - stored.length
+  if (dropped > 0) logger.info(`账号库 ${storedAll.length} 个账号，其中 ${dropped} 个与 live 当前登录态重复，已从切换池剔除`)
+
+  // 账号库凭证存储：池化（默认）与调试端口模式共用同一批实例。
+  const accountStores: Array<{ account: StoredAccount; region: WorkBuddyRegion; id: string; label: string; store: AccountCredentialStore }>
+    = stored.map(account => {
+      const region = account.region ?? regionOfDomain(account.domain)
+      return {
+        account,
+        region,
+        id: `acct:${account.key}`,
+        label: `${region}·${account.nickname ?? account.uin ?? account.label}`,
+        store: new AccountCredentialStore({
+          accountKey: account.key,
+          region,
+          accounts,
+          refresh: credential => client.refreshToken(credential),
+        }),
+      }
+    })
+
+  // ---- 模式 1：跟随官方 live 登录态（端口 39301/39302），并承载该区域全部候选账号 ----
   const liveMode = (process.env['WORKBUDDY_LIVE_MODE'] ?? 'on') !== 'off'
   if (liveMode) {
     for (const region of (['cn', 'global'] as WorkBuddyRegion[])) {
@@ -130,34 +188,33 @@ async function main(): Promise<void> {
         catalog: new WorkBuddyCatalog(region),
         signin: new WorkBuddySigninService(store, client),
         scheduler: schedulerOf(),
+        // 该地区账号库账号并入本端口的切换池
+        pool: ACCOUNT_PORTS_ENABLED
+          ? []
+          : accountStores.filter(a => a.region === region).map(a => ({ id: a.id, label: a.label, store: a.store })),
       })
     }
   }
 
-  // ---- 模式 2：账号库（每账号一端口，39320 起）----
-  const stored: StoredAccount[] = await accounts.load()
-  stored.forEach((account, index) => {
-    const region = account.region ?? regionOfDomain(account.domain)
-    const store = new AccountCredentialStore({
-      accountKey: account.key,
-      region,
-      accounts,
-      refresh: credential => client.refreshToken(credential),
+  // ---- 模式 2（默认关闭）：账号库每账号单独一端口，仅调试用 ----
+  if (ACCOUNT_PORTS_ENABLED) {
+    accountStores.forEach((a, index) => {
+      runtimes.push({
+        id: a.id,
+        label: a.label,
+        region: a.region,
+        port: ACCOUNT_PORT_BASE + index,
+        keyFile: join(KEYS_DIR, `acct-${index}.key`),
+        store: a.store,
+        client,
+        catalog: new WorkBuddyCatalog(a.region),
+        signin: new WorkBuddySigninService(a.store, client),
+        scheduler: schedulerOf(),
+        accountKey: a.account.key,
+        pool: [],
+      })
     })
-    runtimes.push({
-      id: `acct:${account.key}`,
-      label: `${region}·${account.nickname ?? account.uin ?? account.label}`,
-      region,
-      port: ACCOUNT_PORT_BASE + index,
-      keyFile: join(KEYS_DIR, `acct-${index}.key`),
-      store,
-      client,
-      catalog: new WorkBuddyCatalog(region),
-      signin: new WorkBuddySigninService(store, client),
-      scheduler: schedulerOf(),
-      accountKey: account.key,
-    })
-  })
+  }
 
   if (runtimes.length === 0) {
     logger.warn('没有可用的运行时（live 模式关闭且账号库为空）')
@@ -165,16 +222,21 @@ async function main(): Promise<void> {
 
   // 跨端口共享的限流登记表：某账号被 6004 限流后，同区域所有端口都会跳过它
   const rateLimitRegistry = new RateLimitRegistry()
-  // 候选池构造器：给定区域，返回该区域全部运行时的 (id, label, store)
-  const candidatesOf = (region: WorkBuddyRegion) =>
-    runtimes.filter(rt => rt.region === region).map(rt => ({ id: rt.id, label: rt.label, store: rt.store }))
+  // 候选池构造器：给定区域，返回该区域**全部可用账号**（live + 该区域账号库）。
+  // live 端口自身排在首位（由 shim 按 selfId 提权），账号库账号作为后备。
+  const candidatesOf = (region: WorkBuddyRegion) => {
+    const out: Array<{ id: string; label: string; store: CredentialStoreLike }> = []
+    for (const rt of runtimes) {
+      if (rt.region !== region) continue
+      if (rt.accountKey !== undefined) continue // 调试端口模式：账号端口只服务自己
+      out.push({ id: rt.id, label: rt.label, store: rt.store })
+      for (const p of rt.pool) out.push({ id: p.id, label: p.label, store: p.store })
+    }
+    return out
+  }
 
   const shims: WorkBuddyShim[] = []
   for (const rt of runtimes) {
-    if (SIGNIN_ENABLED) {
-      const plan = await rt.scheduler.plan(rt.id)
-      logger.info(`workbuddy(${rt.label}) 今日签到计划 ${formatSec(plan.runAtSec)}`)
-    }
     const token = await loadOrCreateKey(rt.keyFile)
     const sameRegion = candidatesOf(rt.region)
     const shim = createWorkBuddyShim({
@@ -221,21 +283,44 @@ async function main(): Promise<void> {
     void refreshModels(rt)
   }
 
-  // 每日签到：到当天随机时刻自动领取（每个运行时独立随机）
+  // 每日签到：到当天随机时刻自动领取（每个账号独立随机）
+  // 注意：池化模式下账号库账号不是独立 runtime，须单列出来一起签到，
+  // 否则它们会永远收不到每日积分。
+  const signinTargets: Array<{ id: string; label: string; signin: WorkBuddySigninService; scheduler: SigninScheduler }> = []
+  for (const rt of runtimes) {
+    if (rt.accountKey === undefined) {
+      signinTargets.push({ id: rt.id, label: rt.label, signin: rt.signin, scheduler: rt.scheduler })
+    }
+  }
+  if (!ACCOUNT_PORTS_ENABLED) {
+    for (const a of accountStores) {
+      signinTargets.push({
+        id: a.id,
+        label: a.label,
+        signin: new WorkBuddySigninService(a.store, client),
+        scheduler: schedulerOf(),
+      })
+    }
+  }
+
   async function signinTick(): Promise<void> {
-    for (const rt of runtimes) {
+    for (const t of signinTargets) {
       try {
-        await rt.scheduler.runIfDue(rt.id, () => rt.signin.claim())
+        await t.scheduler.runIfDue(t.id, () => t.signin.claim())
       } catch {
         // 未登录 / token 失效：静默跳过
       }
     }
   }
   if (SIGNIN_ENABLED) {
+    for (const t of signinTargets) {
+      const plan = await t.scheduler.plan(t.id)
+      logger.info(`workbuddy(${t.label}) 今日签到计划 ${formatSec(plan.runAtSec)}`)
+    }
     setTimeout(() => { void signinTick() }, SIGNIN_INITIAL_DELAY_MS).unref()
     signinTimer = setInterval(() => { void signinTick() }, SIGNIN_TICK_MS)
     signinTimer.unref()
-    logger.info(`每日签到已启用：本地 ${SIGNIN_START_HOUR}:00–${SIGNIN_END_HOUR}:00 随机时刻自动领取（每账号独立）`)
+    logger.info(`每日签到已启用：本地 ${SIGNIN_START_HOUR}:00–${SIGNIN_END_HOUR}:00 随机时刻自动领取（${signinTargets.length} 个账号独立）`)
   }
 
   // 每 6 小时刷新一次模型目录
@@ -247,10 +332,12 @@ async function main(): Promise<void> {
 
   const liveCount = runtimes.filter(r => r.accountKey === undefined).length
   const acctCount = runtimes.length - liveCount
+  const pooled = runtimes.reduce((n, r) => n + r.pool.length, 0)
   logger.info(
     `workbuddy-proxy ${WORKBUDDY_CONNECT_VERSION} 就绪：`
     + `live ${liveCount} 个（${REGION_PORTS.cn}/${REGION_PORTS.global}）`
-    + (acctCount > 0 ? ` + 账号 ${acctCount} 个（端口 ${ACCOUNT_PORT_BASE} 起）` : ''),
+    + (pooled > 0 ? `，切换池 ${pooled} 个账号库账号` : '，切换池为空')
+    + (acctCount > 0 ? ` + 调试账号端口 ${acctCount} 个（端口 ${ACCOUNT_PORT_BASE} 起）` : ''),
   )
 
   let closing = false
