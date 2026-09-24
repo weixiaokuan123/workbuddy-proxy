@@ -57,12 +57,13 @@ function modelsBlock(models, indent, region, prior) {
 
 /** 生成两个 provider 块（国内/国际），交给定位替换使用。 */
 function buildProviders(plan, existingText = '') {
-  const prior = existingModelMeta(existingText)
   const blocks = []
   for (const region of ['cn', 'global']) {
     const p = plan[region]
     if (p === undefined) continue
     const key = region === 'cn' ? 'workbuddy-cn' : 'workbuddy-global'
+    // 关键：prior 必须 per-region 计算，否则 cn 的 `hy3` 会捡到 global 的展示名。
+    const prior = existingModelMeta(existingText, key)
     const lines = [
       `    "${key}": {`,
       `      "npm": "@ai-sdk/openai-compatible",`,
@@ -203,31 +204,46 @@ const DISPLAY_NAMES = {
  * 关键：只扫描 **workbuddy-cn / workbuddy-global 自己的块**。
  * 之前扫全文导致跨 provider 污染（国际版的 gpt-5.4 会捡到 Trae 的展示名）。
  */
-function existingModelMeta(text) {
+function existingModelMeta(text, key) {
   const out = new Map()
-  for (const key of ['workbuddy-cn', 'workbuddy-global']) {
-    const range = findProviderBlock(text, key)
-    if (range === null) continue
-    const scope = text.slice(range.start, range.end)
-    const modelsAt = scope.indexOf('"models"')
-    if (modelsAt === -1) continue
-    const body = scope.slice(modelsAt)
-    const re = /"([A-Za-z0-9._-]+)"\s*:\s*\{([^{}]*)\}/g
-    let m
-    while ((m = re.exec(body)) !== null) {
-      const inner = m[2]
-      if (!inner.includes('"name"')) continue
-      const name = /"name"\s*:\s*"([^"]*)"/.exec(inner)?.[1]
-      const ctx = /"context"\s*:\s*(\d+)/.exec(inner)?.[1]
-      const output = /"output"\s*:\s*(\d+)/.exec(inner)?.[1]
-      if (name !== undefined) {
-        out.set(m[1], {
-          name,
-          context: ctx ? Number(ctx) : undefined,
-          output: output ? Number(output) : undefined,
-        })
-      }
+  const range = findProviderBlock(text, key)
+  if (range === null) return out
+  const scope = text.slice(range.start, range.end)
+  const modelsAt = scope.indexOf('"models"')
+  if (modelsAt === -1) return out
+  // 定位 models 对象体的起始 `{`，从其内部开始扫描模型条目。
+  // 关键：不能从 `"models"` 键开始，否则正则首匹配会命中 `"models"` 本身，
+  // 配对扫描会吞掉整个 models 对象，真正的模型条目一个都提不出来。
+  const openBrace = scope.indexOf('{', modelsAt)
+  if (openBrace === -1) return out
+  const re = /"([A-Za-z0-9._-]+)"\s*:\s*\{/g
+  re.lastIndex = openBrace + 1
+  let m
+  while ((m = re.exec(scope)) !== null) {
+    // 嵌套的 `"limit": {` 也会被匹配到，但它的内容没有 `"name"`，会被 continue 跳过
+    const open = scope.indexOf('{', m.index)
+    if (open === -1) continue
+    let depth = 0, inStr = false, p = open
+    for (; p < scope.length; p++) {
+      const c = scope[p]
+      if (inStr) { if (c === '\\') { p++; continue } if (c === '"') inStr = false; continue }
+      if (c === '"') { inStr = true; continue }
+      if (c === '{') depth++
+      else if (c === '}') { depth--; if (depth === 0) break }
     }
+    const inner = scope.slice(open + 1, p)
+    if (!inner.includes('"name"')) continue
+    const name = /"name"\s*:\s*"([^"]*)"/.exec(inner)?.[1]
+    const ctx = /"context"\s*:\s*(\d+)/.exec(inner)?.[1]
+    const output = /"output"\s*:\s*(\d+)/.exec(inner)?.[1]
+    if (name !== undefined) {
+      out.set(m[1], {
+        name,
+        context: ctx ? Number(ctx) : undefined,
+        output: output ? Number(output) : undefined,
+      })
+    }
+    re.lastIndex = p + 1
   }
   return out
 }
