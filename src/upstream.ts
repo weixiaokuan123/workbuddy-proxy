@@ -1,6 +1,6 @@
 /**
- * WorkBuddy (CodeBuddy / copilot.tencent.com) upstream client: chat streaming,
- * token refresh, model catalog, and credit balance.
+ * WorkBuddy（CodeBuddy / copilot.tencent.com）上游客户端：聊天流式转发、
+ * token 刷新、模型目录与积分余额。
  *
  * 参考：corrinehu/dsh-workbuddy-connect（MIT，Copyright (c) 2026 Corrine Hu）
  *   — 端点与 wire behavior 由其实现，上游协议本身参照
@@ -21,7 +21,7 @@
  *   只答 `/v2`、`/console` 形态返回 HTTP 500——统一 `/v2` 即同时覆盖
  *   国内版与国际版（WorkBuddy AI）账号，区域由 `domain` 自动路由。
  *
- * @module dsh-connect-workbuddy/upstream
+ * @module workbuddy-proxy/upstream
  */
 
 import type { WorkBuddyCredential } from './auth.ts'
@@ -445,16 +445,16 @@ async function readEnvelope(response: Response): Promise<Envelope> {
   } catch {
     if (isGatewayAuthRejection(response.status, text)) {
       throw new Error(
-        `workbuddy: the signed-in credential was rejected by the upstream gateway (http ${response.status}).`
-        + ' The stored token is no longer accepted — most likely a stale credential file from an earlier'
-        + ' sign-in was selected. Re-sign in to the WorkBuddy desktop app, then pick that account in the'
-        + ' plugin card. Run `dsh-connect-workbuddy doctor` to list every discovered credential.',
+        `workbuddy: 上游网关拒绝了当前登录凭据（http ${response.status}）。`
+        + ' 已保存的 token 不再被接受——很可能是选中了更早一次登录留下的过期凭据文件。'
+        + ' 请在 WorkBuddy 桌面端重新登录，然后在插件卡片里选择该账号。'
+        + ' 可运行 `dsh-connect-workbuddy doctor` 列出所有已发现的凭据。',
       )
     }
-    throw new Error(`workbuddy upstream returned non-JSON (http ${response.status}): ${text.slice(0, 160)}`)
+    throw new Error(`workbuddy 上游返回了非 JSON 响应（http ${response.status}）：${text.slice(0, 160)}`)
   }
   if (typeof parsed !== 'object' || parsed === null) {
-    throw new Error(`workbuddy upstream returned an unexpected document (http ${response.status})`)
+    throw new Error(`workbuddy 上游返回了非预期文档（http ${response.status}）`)
   }
   const document = parsed as Record<string, unknown>
   const envelope: Envelope = {
@@ -468,7 +468,7 @@ async function readEnvelope(response: Response): Promise<Envelope> {
 /** Fail an envelope whose business code is non-zero, classified like HTTP errors. */
 function envelopeError(status: number, envelope: Envelope): Error {
   const kind = classifyUpstreamError(status, envelope.msg)
-  return new Error(`workbuddy upstream ${kind} (http ${status}): ${envelope.msg.slice(0, 160)}`)
+  return new Error(`workbuddy 上游错误 ${kind}（http ${status}）：${envelope.msg.slice(0, 160)}`)
 }
 
 /**
@@ -563,7 +563,7 @@ export function selectCliModels(rawModels: unknown, agents: unknown): WorkBuddyU
   const models = ids
     .map(id => byId.get(id))
     .filter((model): model is WorkBuddyUpstreamModel => model !== undefined)
-  if (models.length === 0) throw new Error('workbuddy model catalog resolved to an empty list')
+  if (models.length === 0) throw new Error('workbuddy 模型目录解析结果为空列表')
   return models
 }
 
@@ -587,7 +587,7 @@ export class WorkBuddyUpstreamClient {
         ...signal === undefined ? {} : { signal },
       })
     } catch (error: unknown) {
-      return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
+      return { ok: false, status: 0, kind: 'server', message: `传输错误：${String(error)}` }
     }
     if (response.ok) {
       // 关键：上游有时以 HTTP 200 + JSON 错误信封返回业务失败
@@ -634,7 +634,7 @@ export class WorkBuddyUpstreamClient {
       ? envelope.data as Record<string, unknown>
       : {}
     const accessToken = typeof data['accessToken'] === 'string' ? data['accessToken'] : ''
-    if (accessToken === '') throw new Error('workbuddy token refresh returned no accessToken; sign in again in the WorkBuddy app')
+    if (accessToken === '') throw new Error('workbuddy: token 刷新未返回 accessToken，请重新登录 WorkBuddy 桌面端')
     const outcome: WorkBuddyRefreshOutcome = { accessToken }
     if (typeof data['refreshToken'] === 'string' && data['refreshToken'] !== '') outcome.refreshToken = data['refreshToken']
     if (typeof data['expiresIn'] === 'number' && data['expiresIn'] > 0) outcome.expiresInSec = data['expiresIn']

@@ -218,7 +218,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     req.on('data', (chunk: Buffer) => {
       size += chunk.length
       if (size > REQUEST_BODY_LIMIT) {
-        reject(new Error('request body too large'))
+        reject(new Error('请求体过大'))
         req.destroy()
         return
       }
@@ -269,15 +269,15 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
       if (!hostIsLoopback(req.headers.host)) {
-        writeOpenAIError(res, 403, 'host_not_allowed', 'Host header must name the loopback interface')
+        writeOpenAIError(res, 403, 'host_not_allowed', 'Host 头必须指向回环接口')
         return
       }
       if (!originIsLoopback(req.headers.origin)) {
-        writeOpenAIError(res, 403, 'origin_not_allowed', 'Origin must be a loopback origin')
+        writeOpenAIError(res, 403, 'origin_not_allowed', 'Origin 必须是回环来源')
         return
       }
       if (!bearerOk(req)) {
-        writeOpenAIError(res, 401, 'unauthorized', 'missing or invalid Authorization bearer')
+        writeOpenAIError(res, 401, 'unauthorized', '缺少或无效的 Authorization bearer')
         return
       }
       const url = req.url ?? '/'
@@ -318,12 +318,12 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         }
       }
       if (url.split('?')[0] === '/signin/status' && req.method === 'GET') {
-        if (!options.signinStatus) { writeOpenAIError(res, 404, 'not_found', 'sign-in not available'); return }
+        if (!options.signinStatus) { writeOpenAIError(res, 404, 'not_found', '签到功能不可用'); return }
         try { writeJson(res, 200, await options.signinStatus()); return }
         catch (error) { writeOpenAIError(res, 502, 'signin_error', error instanceof Error ? error.message : String(error)); return }
       }
       if (url.split('?')[0] === '/signin/claim' && req.method === 'POST') {
-        if (!options.signinClaim) { writeOpenAIError(res, 404, 'not_found', 'sign-in not available'); return }
+        if (!options.signinClaim) { writeOpenAIError(res, 404, 'not_found', '签到功能不可用'); return }
         try { writeJson(res, 200, await options.signinClaim()); return }
         catch (error) { writeOpenAIError(res, 502, 'signin_error', error instanceof Error ? error.message : String(error)); return }
       }
@@ -331,7 +331,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         await chatCompletions(req, res)
         return
       }
-      writeOpenAIError(res, 404, 'not_found', `no such route: ${req.method} ${url}`)
+      writeOpenAIError(res, 404, 'not_found', `没有该路由：${req.method} ${url}`)
     } catch (error: unknown) {
       if (!res.headersSent) {
         writeOpenAIError(res, 500, 'internal', String(error))
@@ -429,7 +429,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
   async function chatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!isJsonContentType(req)) {
-      writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type must be application/json')
+      writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type 必须是 application/json')
       return
     }
 
@@ -508,7 +508,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           if (chunk.includes('[DONE]')) sawDone = true
         })
         body.on('error', (error: unknown) => {
-          logger?.warn(`workbuddy(${region}): upstream stream failed mid-flight`, error)
+          logger?.warn(`workbuddy(${region}): 上游流式转发中途失败`, error)
           if (!sawDone && res.writable) res.end('data: [DONE]\n\n')
         })
         body.pipe(res)
@@ -535,7 +535,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     }
 
     // 全部候选都失败：如实报错，并在文案里说明已尝试过切号
-    const failure = lastFailure ?? { status: 502, kind: 'server' as UpstreamErrorKind, message: 'no usable account' }
+    const failure = lastFailure ?? { status: 502, kind: 'server' as UpstreamErrorKind, message: '没有可用账号' }
     const tried = attempts.length
     const suffix = limitedCount > 0
       ? `（已尝试 ${tried} 个同区域账号，其中 ${limitedCount} 个因额度限流被跳过）`
@@ -544,7 +544,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       res,
       KIND_STATUS[failure.kind],
       failure.kind,
-      `workbuddy upstream ${failure.kind} (http ${failure.status})${suffix}: ${failure.message.slice(0, 400)}`,
+      `workbuddy 上游 ${failure.kind}（http ${failure.status}）${suffix}：${failure.message.slice(0, 400)}`,
     )
   }
 
