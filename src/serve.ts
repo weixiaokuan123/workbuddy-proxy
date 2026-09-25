@@ -21,6 +21,8 @@ import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { WorkBuddySigninService } from './signin.ts'
 import { SigninScheduler, formatSec } from './scheduler.ts'
 
+import { redactPaths } from './redact.ts'
+
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
 const KEYS_DIR = join(ROOT, 'keys')
@@ -76,10 +78,25 @@ function ts(): string {
   return new Date().toISOString()
 }
 
+/**
+ * 日志参数格式化。
+ *
+ * - 对象不再被 String() 压成 "[object Object]"，改为 JSON，保住诊断信息；
+ * - 统一做路径脱敏：日志会追加落盘长期保存，不应写入本机用户名与目录结构。
+ */
+function fmtLogArgs(args: unknown[]): string {
+  const text = args.map((a) => {
+    if (typeof a === 'string') return a
+    if (a instanceof Error) return `${a.name}: ${a.message}`
+    try { return JSON.stringify(a) ?? String(a) } catch { return String(a) }
+  }).join(' ')
+  return redactPaths(text)
+}
+
 const logger: ShimLogger = {
-  info: (...args) => process.stdout.write(`[${ts()}] [info] ${args.map(String).join(' ')}\n`),
-  warn: (...args) => process.stderr.write(`[${ts()}] [warn] ${args.map(String).join(' ')}\n`),
-  error: (...args) => process.stderr.write(`[${ts()}] [error] ${args.map(String).join(' ')}\n`),
+  info: (...args) => process.stdout.write(`[${ts()}] [info] ${fmtLogArgs(args)}\n`),
+  warn: (...args) => process.stderr.write(`[${ts()}] [warn] ${fmtLogArgs(args)}\n`),
+  error: (...args) => process.stderr.write(`[${ts()}] [error] ${fmtLogArgs(args)}\n`),
 }
 
 /** 读取或首次生成某区域的持久 bearer key（0600）。 */
@@ -117,9 +134,10 @@ async function main(): Promise<void> {
 
   if (SIGNIN_ENABLED) await mkdir(STATE_DIR, { recursive: true, mode: 0o700 })
 
-  // 共享签到状态文件（live 与账号共用一份，target 名区分）
-  const schedulerOf = (): SigninScheduler => new SigninScheduler({
-    stateFile: join(STATE_DIR, 'signin-state.json'),
+  // 签到状态按区域分文件：同一区域内的 live 与账号共用一份（target 名区分），
+  // 不同区域分开——否则两个调度器各持内存副本整体回写时会互相覆盖（丢更新）。
+  const schedulerOf = (region: WorkBuddyRegion): SigninScheduler => new SigninScheduler({
+    stateFile: join(STATE_DIR, `signin-state-${region}.json`),
     startHour: SIGNIN_START_HOUR,
     endHour: SIGNIN_END_HOUR,
     log: m => logger.info(m),
@@ -187,7 +205,7 @@ async function main(): Promise<void> {
         client,
         catalog: new WorkBuddyCatalog(region),
         signin: new WorkBuddySigninService(store, client),
-        scheduler: schedulerOf(),
+        scheduler: schedulerOf(region),
         // 该地区账号库账号并入本端口的切换池
         pool: ACCOUNT_PORTS_ENABLED
           ? []
@@ -209,7 +227,7 @@ async function main(): Promise<void> {
         client,
         catalog: new WorkBuddyCatalog(a.region),
         signin: new WorkBuddySigninService(a.store, client),
-        scheduler: schedulerOf(),
+        scheduler: schedulerOf(a.region),
         accountKey: a.account.key,
         pool: [],
       })
@@ -298,7 +316,7 @@ async function main(): Promise<void> {
         id: a.id,
         label: a.label,
         signin: new WorkBuddySigninService(a.store, client),
-        scheduler: schedulerOf(),
+        scheduler: schedulerOf(a.region),
       })
     }
   }
