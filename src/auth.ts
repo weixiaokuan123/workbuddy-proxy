@@ -8,8 +8,8 @@
  *  - 只读对应区域的“当前登录态”单一文件，不再扫描历史时间戳备份；
  *  - cn 读 workbuddy-desktop.info，global 读 workbuddy-desktop-ai.info
  *    （原版把 -ai.info 误当备份、且永远让 .info 压过它）；
- *  - 每次调用都实时重读文件，无缓存、无 mtime/hash 门禁——外部切号写文件后，
- *    下一次请求立即跟随；
+ *  - 以「文件 mtimeMs + size」为门禁缓存读盘结果：签名不变不重读，签名一变
+ *    （外部切号写 live 文件）下一次请求立即跟随，无固定 TTL；
  *  - 不做多账号选择、不做 selected 锁定；
  *  - token 刷新结果只保存在进程内存，绝不写回桌面端文件，也不落地任何副本；
  *  - 去掉 @deepseek-ai/dsh-home-paths 与 @deepseek-ai/dsh-atomic-write 两个依赖。
@@ -17,7 +17,7 @@
  * @module workbuddy-proxy/auth
  */
 
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { regionOf, type WorkBuddyRefreshOutcome, type WorkBuddyRegion } from './upstream.ts'
@@ -158,6 +158,23 @@ function isENOENT(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT'
 }
 
+/**
+ * 候选 live 文件的组合签名（每个文件 mtimeMs + size）。
+ * 任一候选被创建/改写/删除都会改变签名，据此决定是否重读；不使用固定 TTL。
+ */
+async function liveSignature(paths: readonly string[]): Promise<string> {
+  const parts: string[] = []
+  for (const path of paths) {
+    try {
+      const info = await stat(path)
+      parts.push(`${path}:${info.mtimeMs}:${info.size}`)
+    } catch {
+      parts.push(`${path}:missing`)
+    }
+  }
+  return parts.join('|')
+}
+
 /** Store 构造参数。 */
 export interface LiveStoreOptions {
   region: WorkBuddyRegion
@@ -172,9 +189,10 @@ export interface LiveStoreOptions {
 /**
  * 单区域、单 live 文件的凭据 store。
  *
- * 每次 current()/resolve() 都重新读盘，因此 workbuddy-switch 改写 live 文件后
- * 无需重启即可跟随。刷新结果仅存内存（按“文件签发时间”绑定，文件一旦变化
- * 即丢弃内存 token，避免切号后仍用旧账号的刷新 token）。
+ * 读盘以「文件 mtimeMs + size」为门禁：签名不变直接复用进程内结果，
+ * 签名一变（workbuddy-switch 等工具改写 live 文件切号）下一次调用立即重读，
+ * 无需重启即可跟随，也不存在固定 TTL 的延迟。刷新结果仅存内存
+ * （按“文件签发时间”绑定，文件一旦变化即丢弃内存 token，避免切号后仍用旧账号的刷新 token）。
  */
 export class LiveCredentialStore {
   private readonly region: WorkBuddyRegion
@@ -183,6 +201,8 @@ export class LiveCredentialStore {
   private readonly livePathOverride?: string
   private mem: { key: string; credential: WorkBuddyCredential } | undefined
   private inflight: Promise<WorkBuddyCredential> | undefined
+  /** live 文件门禁缓存：签名（mtimeMs + size）不变即复用；签名一变立即重读。 */
+  private liveCache: { signature: string; live: { credential: WorkBuddyCredential; filePath: string } | undefined } | undefined
 
   constructor(options: LiveStoreOptions) {
     this.region = options.region
@@ -211,17 +231,27 @@ export class LiveCredentialStore {
 
   /** 读取磁盘上当前登录态；文件缺失/无法解析返回 undefined。 */
   private async readLive(): Promise<{ credential: WorkBuddyCredential; filePath: string } | undefined> {
-    for (const path of this.candidates()) {
+    const paths = this.candidates()
+    const signature = await liveSignature(paths)
+    // 签名未变：直接复用缓存结果（包括「未找到」），不再逐个 readFile + JSON.parse。
+    if (this.liveCache !== undefined && this.liveCache.signature === signature) return this.liveCache.live
+
+    let live: { credential: WorkBuddyCredential; filePath: string } | undefined
+    for (const path of paths) {
       try {
         const parsed = parseWorkBuddyAuth(await readFile(path, 'utf8'), path)
-        if (parsed !== undefined) return { credential: parsed, filePath: path }
+        if (parsed !== undefined) {
+          live = { credential: parsed, filePath: path }
+          break
+        }
       } catch (error: unknown) {
         if (!isENOENT(error)) {
           // 文件存在但读取/解析失败：继续尝试下一个候选
         }
       }
     }
-    return undefined
+    this.liveCache = { signature, live }
+    return live
   }
 
   /** 当前应使用的凭据（已按区域校验，必要时刷新），不抛错版供状态查询。 */

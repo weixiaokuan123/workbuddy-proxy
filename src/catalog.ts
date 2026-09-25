@@ -1,6 +1,5 @@
 /**
- * WorkBuddy model catalog: a static fallback list, replaced by the upstream's
- * dynamic catalog once it loads, and filtered by the user's explicit selection.
+ * WorkBuddy 模型目录：静态 fallback 列表，上游目录加载成功后由动态目录替换。
  *
  * 参考：dingminhua/dsh-connect-trae（MIT，Copyright (c) 2026 LaoDing）
  *   — 「上次刷新的完整目录（lastCatalog）与用户勾选分离，运行时目录由两者
@@ -12,7 +11,7 @@
  *   上游没有独立的长上下文开关或第二个模型 id，因此不会虚构 `@1m` 变体。
  *   本目录额外承载上游给出的积分倍率、多模态与推理档位。
  *
- * @module dsh-connect-workbuddy/catalog
+ * @module workbuddy-proxy/catalog
  */
 
 import type { WorkBuddyUpstreamModel } from './upstream.ts'
@@ -82,38 +81,6 @@ export function fallbackModelsFor(region: 'cn' | 'global'): readonly WorkBuddyMo
   return region === 'global' ? FALLBACK_WORKBUDDY_MODELS_GLOBAL : FALLBACK_WORKBUDDY_MODELS
 }
 
-/**
- * Derive the runtime catalog from the last-refreshed directory plus the
- * user's selection. This is the single source of truth for what DSH exposes,
- * so saving only the selection is enough to rebuild it after a restart.
- *
- * An empty selection falls back to the whole directory: a plugin that has
- * never been configured must still serve models rather than nothing.
- */
-export type WorkBuddyContextBudget = number
-
-/** Apply the saved local DSH budget; models above 200K default to 200K. */
-export function applyContextBudgets(
-  catalog: readonly WorkBuddyModelInfo[],
-  budgets: Readonly<Record<string, WorkBuddyContextBudget | undefined>> = {},
-): WorkBuddyModelInfo[] {
-  return catalog.map(model => ({
-    ...model,
-    contextWindow: model.contextWindow > 200_000
-      ? Math.min(model.contextWindow, budgets[model.id] ?? 200_000)
-      : model.contextWindow,
-  }))
-}
-
-export function deriveCatalog(
-  catalog: readonly WorkBuddyModelInfo[],
-  enabled: ReadonlySet<string>,
-  budgets: Readonly<Record<string, WorkBuddyContextBudget | undefined>> = {},
-): WorkBuddyModelInfo[] {
-  const selected = enabled.size === 0 ? catalog : catalog.filter(model => enabled.has(model.id))
-  return applyContextBudgets(selected, budgets)
-}
-
 /** Mutable catalog shared by the shim's `/v1/models` and the adapter. */
 export class WorkBuddyCatalog {
   private models: readonly WorkBuddyModelInfo[]
@@ -134,7 +101,7 @@ export class WorkBuddyCatalog {
 
   /** Replace the list; callers invalidate their adapter snapshot after this. */
   set(models: readonly WorkBuddyModelInfo[]): void {
-    if (models.length === 0) throw new Error('workbuddy model catalog cannot be empty')
+    if (models.length === 0) throw new Error('workbuddy 模型目录不能为空')
     this.models = models.map(model => ({ ...model }))
   }
 }

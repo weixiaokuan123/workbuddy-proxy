@@ -16,10 +16,9 @@
  * @module workbuddy-proxy/accounts
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { parseWorkBuddyAuth, type WorkBuddyCredential } from './auth.ts'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
+import type { WorkBuddyCredential } from './auth.ts'
 import type { WorkBuddyRegion } from './upstream.ts'
 
 export interface StoredAccount {
@@ -49,35 +48,6 @@ export function regionOfDomain(domain: string): WorkBuddyRegion {
   const d = domain.trim().toLowerCase()
   if (d === 'codebuddy.ai' || d.endsWith('.codebuddy.ai') || d.endsWith('workbuddy.ai')) return 'global'
   return 'cn'
-}
-
-function accountKey(region: WorkBuddyRegion, uid: string, domain: string): string {
-  return uid !== '' ? `${region}:${uid}` : `${region}:${domain}`
-}
-
-/** 从 WorkBuddyCredential 构造库记录。 */
-export function toStored(
-  credential: WorkBuddyCredential,
-  region: WorkBuddyRegion,
-  source: StoredAccount['source'],
-): StoredAccount {
-  const uid = credential.uid !== '' ? credential.uid : ''
-  return {
-    key: accountKey(region, uid, credential.domain),
-    label: credential.nickname ?? credential.uin ?? (uid !== '' ? uid : credential.domain) ?? 'unknown',
-    region,
-    domain: credential.domain,
-    uid,
-    accessToken: credential.accessToken,
-    refreshToken: credential.refreshToken,
-    expiresAtMs: credential.expiresAtMs,
-    ...credential.refreshExpiresAtMs === undefined ? {} : { refreshExpiresAtMs: credential.refreshExpiresAtMs },
-    ...credential.enterpriseId === undefined ? {} : { enterpriseId: credential.enterpriseId },
-    ...credential.nickname === undefined ? {} : { nickname: credential.nickname },
-    ...credential.uin === undefined ? {} : { uin: credential.uin },
-    source,
-    createdAtMs: Date.now(),
-  }
 }
 
 /** 把库记录转成代理内部使用的凭证形态。 */
@@ -146,108 +116,55 @@ export function identityKeysOfCredential(
   return keys
 }
 
-/** workbuddy-switch accounts.json 的单条记录形态（宽松）。 */
-interface SwitchAccount {
-  id?: unknown
-  uid?: unknown
-  email?: unknown
-  nickname?: unknown
-  variant?: unknown
-  domain?: unknown
-  access_token?: unknown
-  refresh_token?: unknown
-  expiresAt?: unknown
-  refreshExpiresAt?: unknown
-  token_type?: unknown
-  enterpriseId?: unknown
-  auth_raw?: unknown
-}
-
-function str(v: unknown): string {
-  return typeof v === 'string' ? v : ''
-}
-
-function num(v: unknown): number {
-  return typeof v === 'number' ? v : 0
-}
-
-/**
- * 解析 workbuddy-switch 的 accounts.json 为库记录。
- * 缺 access_token 的记录会被跳过。
- */
-export function parseSwitchAccounts(text: string): StoredAccount[] {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    return []
-  }
-  if (!Array.isArray(parsed)) return []
-
-  const out: StoredAccount[] = []
-  for (const raw of parsed) {
-    if (typeof raw !== 'object' || raw === null) continue
-    const a = raw as SwitchAccount
-
-    // 优先用 auth_raw 里的完整文档（含 expiresAt 等权威字段），退回扁平字段
-    let credential: WorkBuddyCredential | undefined
-    if (typeof a.auth_raw === 'object' && a.auth_raw !== null) {
-      credential = parseWorkBuddyAuth(JSON.stringify(a.auth_raw), '<switch>')
-    }
-    const accessToken = str(a.access_token)
-    if (credential === undefined && accessToken === '') continue
-
-    const domain = credential?.domain || str(a.domain)
-    const variant = str(a.variant)
-    const region: WorkBuddyRegion = variant === 'global' ? 'global' : (variant === 'cn' ? 'cn' : regionOfDomain(domain))
-    const uid = credential?.uid || str(a.uid)
-    const merged: WorkBuddyCredential = credential ?? {
-      accessToken,
-      refreshToken: str(a.refresh_token),
-      expiresAtMs: num(a.expiresAt),
-      ...num(a.refreshExpiresAt) === 0 ? {} : { refreshExpiresAtMs: num(a.refreshExpiresAt) },
-      domain,
-      uid,
-    }
-    // auth_raw 可能缺 refreshToken（switch 把它存平铺字段），这里补齐
-    if (merged.refreshToken === '' && str(a.refresh_token) !== '') merged.refreshToken = str(a.refresh_token)
-    if (merged.expiresAtMs === 0 && num(a.expiresAt) !== 0) merged.expiresAtMs = num(a.expiresAt)
-    if (merged.refreshExpiresAtMs === undefined && num(a.refreshExpiresAt) !== 0) {
-      merged.refreshExpiresAtMs = num(a.refreshExpiresAt)
-    }
-    if (merged.nickname === undefined && str(a.nickname) !== '') merged.nickname = str(a.nickname)
-    if (merged.uid === '' && str(a.uid) !== '') merged.uid = str(a.uid)
-
-    const stored = toStored(merged, region, 'switch')
-    // 用 switch 自己的 id 作为 key 更稳定（同名账号也能区分）
-    if (str(a.id) !== '') stored.key = `switch:${str(a.id)}`
-    out.push(stored)
-  }
-  return out
-}
-
-/** workbuddy-switch 账号库默认路径。 */
-export function switchAccountsPath(home: string = homedir()): string {
-  return join(home, '.wb-switch', 'accounts.json')
-}
-
 export class AccountStore {
   private readonly file: string
+  /** 进程内缓存：以文件签名（mtimeMs + size）为准，签名不变就不重读。 */
+  private cache: { signature: string; accounts: StoredAccount[] } | undefined
+  /** 并发 load() 共享同一次读盘，避免 /status 的 Promise.all 放大成 N 次读取。 */
+  private pending: Promise<StoredAccount[]> | undefined
 
   constructor(file: string) {
     this.file = file
   }
 
+  /** 文件签名：mtimeMs + size；文件缺失返回 undefined。 */
+  private async signature(): Promise<string | undefined> {
+    try {
+      const info = await stat(this.file)
+      return `${info.mtimeMs}:${info.size}`
+    } catch {
+      return undefined
+    }
+  }
+
   async load(): Promise<StoredAccount[]> {
+    const signature = await this.signature()
+    // 文件缺失：视为空库并丢弃缓存（外部删除后不能继续返回旧内容）。
+    if (signature === undefined) {
+      this.cache = undefined
+      return []
+    }
+    // 签名未变：直接命中缓存，不再 readFile + JSON.parse。
+    if (this.cache !== undefined && this.cache.signature === signature) return this.cache.accounts
+    this.pending ??= this.readFresh(signature).finally(() => { this.pending = undefined })
+    return this.pending
+  }
+
+  /** 真正读盘；仅在签名变化时调用。 */
+  private async readFresh(signature: string): Promise<StoredAccount[]> {
+    let accounts: StoredAccount[]
     try {
       const text = await readFile(this.file, 'utf8')
       const parsed = JSON.parse(text) as unknown
-      if (!Array.isArray(parsed)) return []
-      return parsed.filter((a): a is StoredAccount =>
-        typeof a === 'object' && a !== null && typeof (a as StoredAccount).key === 'string')
+      accounts = Array.isArray(parsed)
+        ? parsed.filter((a): a is StoredAccount =>
+            typeof a === 'object' && a !== null && typeof (a as StoredAccount).key === 'string')
+        : []
     } catch {
-      return []
+      accounts = []
     }
+    this.cache = { signature, accounts }
+    return accounts
   }
 
   async save(accounts: StoredAccount[]): Promise<void> {
@@ -255,6 +172,9 @@ export class AccountStore {
     const tmp = `${this.file}.tmp`
     await writeFile(tmp, JSON.stringify(accounts, null, 2) + '\n', 'utf8')
     await rename(tmp, this.file)
+    // 写盘后同步刷新缓存签名，后续 load() 立即命中，无需再读盘。
+    const signature = await this.signature()
+    this.cache = signature === undefined ? undefined : { signature, accounts }
   }
 
   /** 按 key 插入或覆盖。 */
