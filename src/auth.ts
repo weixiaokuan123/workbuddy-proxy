@@ -22,6 +22,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { regionOf, type WorkBuddyRefreshOutcome, type WorkBuddyRegion } from './upstream.ts'
 
+import { redactPaths } from './redact.ts'
+
 /** 规范化后的 WorkBuddy 凭据，时间戳均为 epoch 毫秒。 */
 export interface WorkBuddyCredential {
   accessToken: string
@@ -243,7 +245,7 @@ export class LiveCredentialStore {
     if (regionOf(live.credential.domain) !== this.region) {
       throw new Error(
         `workbuddy(${this.region}): live 文件账号区域不符（domain="${live.credential.domain}"）；`
-        + `该端口期望 ${this.region} 账号，请检查 ${live.filePath}`,
+        + `该端口期望 ${this.region} 账号，请检查 ${redactPaths(live.filePath)}`,
       )
     }
 
@@ -294,7 +296,7 @@ export class LiveCredentialStore {
   async status(): Promise<WorkBuddyAuthStatus> {
     const live = await this.readLive()
     if (live === undefined) {
-      return { state: 'signed-out', region: this.region, filePath: this.livePath() }
+      return { state: 'signed-out', region: this.region, filePath: redactPaths(this.livePath()) }
     }
     const regionMismatch = regionOf(live.credential.domain) !== this.region
     return {
@@ -303,7 +305,7 @@ export class LiveCredentialStore {
       account: live.credential.nickname ?? live.credential.uin ?? live.credential.uid,
       ...live.credential.uin === undefined ? {} : { uin: live.credential.uin },
       ...live.credential.domain === '' ? {} : { domain: live.credential.domain },
-      filePath: live.filePath,
+      filePath: redactPaths(live.filePath),
       expiresAtMs: live.credential.expiresAtMs,
       ...regionMismatch
         ? { message: `live 文件是另一区域账号（domain="${live.credential.domain}"）` }
