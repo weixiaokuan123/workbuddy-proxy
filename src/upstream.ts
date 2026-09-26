@@ -401,6 +401,22 @@ export function travelSupported(region: WorkBuddyRegion): boolean {
   return region === 'cn'
 }
 
+/**
+ * 上游错误文案的最大长度。
+ *
+ * `envelope.msg` 是**服务端可控**的字符串，readEnvelope 存的是原样、没有截断。
+ * 旅行的失败文案会同时落到两个长期明文的地方——日志与 state/travel-state.json——
+ * 所以必须在这里截断，否则一个异常上游就能把任意长度的内容灌进磁盘。
+ * 200 字符足够读懂失败原因，超出部分没有信息价值。
+ */
+const TRAVEL_ERROR_MAX = 200
+
+/** 取上游 msg 并截断；为空时退回 http 状态码。 */
+function travelErrorMessage(envelope: Envelope, status: number): string {
+  const text = envelope.msg !== '' ? envelope.msg : `http ${status}`
+  return text.length > TRAVEL_ERROR_MAX ? `${text.slice(0, TRAVEL_ERROR_MAX)}…` : text
+}
+
 /** Chat request headers, including the X-No-* conventions the official CLI uses. */
 function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
   const headers: Record<string, string> = {
@@ -920,7 +936,7 @@ export class WorkBuddyUpstreamClient {
         : {}
       return { ok: true, state: typeof data['state'] === 'string' ? data['state'] : 'traveling' }
     }
-    const message = envelope.msg !== '' ? envelope.msg : `http ${response.status}`
+    const message = travelErrorMessage(envelope, response.status)
     const lower = message.toLowerCase()
     return {
       ok: false,
@@ -949,7 +965,7 @@ export class WorkBuddyUpstreamClient {
       const rewardCredit = typeof raw === 'number' ? raw : null
       return { ok: true, rewardCredit }
     }
-    const message = envelope.msg !== '' ? envelope.msg : `http ${response.status}`
+    const message = travelErrorMessage(envelope, response.status)
     const lower = message.toLowerCase()
     return {
       ok: false,
