@@ -27,6 +27,7 @@ import {
   rollTravelStateToToday,
   localDate as travelLocalDate,
   RETRY_COOLDOWN_MS as TRAVEL_RETRY_COOLDOWN_MS,
+  MAX_SLEEP_MS as MAX_TRAVEL_SLEEP_MS,
   type TravelStateStore,
 } from './travel.ts'
 
@@ -48,9 +49,10 @@ const SIGNIN_INITIAL_DELAY_MS = 60 * 1000
 // ---- 派猫猫旅行（成长中心） ----
 // 只有国内版有成长中心；国际版账号一律跳过（见 travelSupported）。
 const TRAVEL_ENABLED = (process.env['WORKBUDDY_TRAVEL'] ?? 'on') !== 'off'
-// 行程最短 1 小时，10 分钟一轮足够及时领取，且不会给上游压力。
-const TRAVEL_TICK_MS = 10 * 60 * 1000
+// 启动后延迟多久跑第一轮：避开启动过程，再顺手接住「昨天派出、今天可领」。
 const TRAVEL_INITIAL_DELAY_MS = 90 * 1000
+// 全部账号都收工时的兜底轮询间隔（默认 6 小时，见 travel.ts 的 MAX_SLEEP_MS）。
+const TRAVEL_IDLE_POLL_MS = 6 * 60 * 60 * 1000
 
 /** 账号模式端口段：账号 i 使用 BASE + i（39320 起）。 */
 const ACCOUNT_PORT_BASE = Number(process.env['WORKBUDDY_ACCOUNT_PORT_BASE'] ?? 39320)
@@ -509,41 +511,77 @@ async function main(): Promise<void> {
         }
       }
 
+      // 每账号「下次需要查看」的绝对时刻；tick 返回 undefined 表示今日收工。
+      const nextWakeAt = new Map<string, number>()
+
+      /**
+       * 跑一轮，然后按「最早需要被唤醒的时刻」重排定时器。
+       *
+       * 不做固定间隔轮询：一次 4 小时的行程只需醒来两次
+       * （出发时一次、到点领奖时一次），而不是每 10 分钟空转 24 次。
+       */
       const travelTick = async (): Promise<void> => {
         const today = travelLocalDate()
+        const nowMs = Date.now()
         let dirty = false
+
         for (const t of travelTargets) {
           const entry = rollTravelStateToToday(travelStoreData[t.id] ?? createTravelState(today), today)
           travelStoreData[t.id] = entry
 
           // 今日已完成：整轮跳过，不向上游发任何请求。
-          if (entry.done) continue
+          if (entry.done) { nextWakeAt.delete(t.id); continue }
           // 失败冷却中：跳过，避免抖动时持续打上游。
-          if (entry.retryAfterMs !== undefined && Date.now() < entry.retryAfterMs) continue
+          if (entry.retryAfterMs !== undefined && nowMs < entry.retryAfterMs) continue
 
           try {
             const outcome = await t.travel.tick(entry)
             dirty = true
+            if (outcome.nextWakeAtMs === undefined) nextWakeAt.delete(t.id)
+            else nextWakeAt.set(t.id, outcome.nextWakeAtMs)
             if (outcome.acted) logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}`)
             else if (outcome.done) logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}`)
+            else if (outcome.nextWakeAtMs !== undefined) {
+              // 只在「本轮不写上游」时补一条：说明从现在起它会安安静静地睡到到点。
+              const mins = Math.max(1, Math.round((outcome.nextWakeAtMs - Date.now()) / 60000))
+              logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}，${mins} 分钟后再看`)
+            }
           } catch (error) {
             dirty = true
             entry.attemptedAtMs = Date.now()
             entry.retryAfterMs = Date.now() + TRAVEL_RETRY_COOLDOWN_MS
+            nextWakeAt.set(t.id, entry.retryAfterMs)
             const message = `旅行出错：${error instanceof Error ? error.message : String(error)}`
             entry.result = message
             logger.warn(`workbuddy(${t.label}) ${message}`)
           }
         }
+
         if (dirty) await saveTravelState()
+        scheduleNextWake()
+      }
+
+      /** 按所有账号里最早的那个时刻重排定时器。 */
+      const scheduleNextWake = (): void => {
+        if (travelTimer !== undefined) { clearTimeout(travelTimer); travelTimer = undefined }
+        let earliest: number | undefined
+        for (const at of nextWakeAt.values()) {
+          if (earliest === undefined || at < earliest) earliest = at
+        }
+        const now = Date.now()
+        // 全部收工：睡满一整段再整体看一眼（跨天重置由 rollTravelStateToToday 兜住）。
+        const delay = earliest === undefined
+          ? TRAVEL_IDLE_POLL_MS
+          : Math.min(Math.max(earliest - now, 1_000), MAX_TRAVEL_SLEEP_MS)
+        travelTimer = setTimeout(() => { void travelTick() }, delay)
+        travelTimer.unref()
+        logger.info(`旅行下次检查：${new Date(now + delay).toLocaleString('zh-CN')}（${Math.round(delay / 60000)} 分钟后）`)
       }
 
       // 延迟一小会儿再跑首轮：避免在启动过程中抢上游，同时抓住
       // 「昨天派出、今天已到点可领」的情况（与签到的初始延迟同一思路）。
       setTimeout(() => { void travelTick() }, TRAVEL_INITIAL_DELAY_MS).unref()
-      travelTimer = setInterval(() => { void travelTick() }, TRAVEL_TICK_MS)
-      travelTimer.unref()
-      logger.info(`派猫猫旅行已启用：每 ${TRAVEL_TICK_MS / 60000} 分钟推进一次（${travelTargets.length} 个国内版账号）`)
+      logger.info(`派猫猫旅行已启用：按到点时刻精确唤醒，不做固定轮询（${travelTargets.length} 个国内版账号）`)
     }
   }
 
@@ -571,7 +609,7 @@ async function main(): Promise<void> {
     logger.info(`收到 ${signal}，正在关闭...`)
     clearInterval(timer)
     if (signinTimer !== undefined) clearInterval(signinTimer)
-    if (travelTimer !== undefined) clearInterval(travelTimer)
+    if (travelTimer !== undefined) clearTimeout(travelTimer)
     await Promise.allSettled(shims.map(shim => shim.close()))
     process.exit(0)
   }

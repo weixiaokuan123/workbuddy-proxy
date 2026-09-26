@@ -17,7 +17,13 @@
 
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { WorkBuddyTravelService, createTravelState, rollTravelStateToToday } from '../src/travel.ts'
+import {
+  WorkBuddyTravelService,
+  createTravelState,
+  rollTravelStateToToday,
+  CLAIM_GRACE_MS,
+  MAX_SLEEP_MS,
+} from '../src/travel.ts'
 import type { WorkBuddyTravelStatus } from '../src/upstream.ts'
 
 /** 记录写接口调用次数，断言「不该写的时候一个都没写」。 */
@@ -243,4 +249,89 @@ test('到达判定只依赖服务端时间戳之差，与本地时钟无关', as
 
   assert.equal(rec.claims.length, 0, '差值 100 秒 > 0，尚未到达')
   assert.equal(out.done, false)
+})
+
+// ---- 调度：不再固定轮询，而是算出「下一次真正需要看的时刻」 ----
+
+test('traveling 未到点 → 唤醒时刻 = 剩余时间 + 领取余量', async () => {
+  const rec = fresh()
+  // 还差 2 小时（7200 秒）到达
+  const svc = makeService({
+    status: statusOf({ state: 'traveling', recordId: 1, arriveAt: 8200, serverNow: 1000, dailyLimitReached: true }),
+    recorder: rec,
+  })
+  const before = Date.now()
+  const entry = createTravelState('2026-09-26')
+  const out = await svc.tick(entry)
+  const after = Date.now()
+
+  assert.ok(out.nextWakeAtMs !== undefined, '应给出下次唤醒时刻')
+  const delay = (out.nextWakeAtMs as number) - before
+  // 允许 tick 自身的执行耗时抖动
+  assert.ok(
+    delay >= 7200 * 1000 + CLAIM_GRACE_MS - 1000 && delay <= 7200 * 1000 + CLAIM_GRACE_MS + (after - before) + 1000,
+    `唤醒延迟应约为 2h+3min，实际 ${Math.round(delay / 1000)}s`,
+  )
+})
+
+test('已到点但尚未领取 → 唤醒时刻就是「现在 + 余量」', async () => {
+  const rec = fresh()
+  const svc = makeService({
+    // arrive_at 已过（差值 -100 秒），但 claim 会被拒
+    status: statusOf({ state: 'arrived', recordId: 5, arriveAt: 900, serverNow: 1000 }),
+    claim: { ok: false, nothingToClaim: false, notArrivedYet: true, message: 'not arrived yet', code: 400 },
+    recorder: rec,
+  })
+  const before = Date.now()
+  const entry = createTravelState('2026-09-26')
+  const out = await svc.tick(entry)
+
+  assert.ok(out.nextWakeAtMs !== undefined)
+  // 未到点分支走的是重试冷却（10 分钟），而不是领取余量
+  assert.equal(out.nextWakeAtMs, entry.retryAfterMs)
+  assert.ok((out.nextWakeAtMs as number) - before <= 10 * 60 * 1000 + 1000)
+})
+
+test('depart 成功后 → 立即算出到点时刻，不再空转', async () => {
+  const rec = fresh()
+  const svc = makeService({
+    // depart 返回 already，服务端说已派且 3 小时后到
+    status: statusOf({ state: 'idle' }),
+    depart: { ok: false, already: true, dailyLimitReached: false, noBuddy: false, message: 'already traveling', code: 409 },
+    recorder: rec,
+  })
+  const entry = createTravelState('2026-09-26')
+  const out = await svc.tick(entry)
+
+  assert.ok(out.nextWakeAtMs !== undefined, '应给出到点时刻')
+  assert.ok((out.nextWakeAtMs as number) > Date.now(), '唤醒时刻应在未来')
+})
+
+test('今日收工（无 Buddy / 已完成 / 已领取）→ 不再唤醒', async () => {
+  const cases: Array<[string, Parameters<typeof makeService>[0]]> = [
+    ['无 Buddy', { status: statusOf({ buddyId: 0 }) }],
+    ['idle 且已完成', { status: statusOf({ state: 'idle', dailyLimitReached: true }) }],
+    ['领取成功', {
+      status: statusOf({ state: 'arrived', recordId: 3 }),
+      claim: { ok: true, rewardCredit: 5 },
+    }],
+  ]
+  for (const [name, spec] of cases) {
+    const rec = fresh()
+    const entry = createTravelState('2026-09-26')
+    const out = await svc0(spec, rec).tick(entry)
+    assert.equal(out.done, true, `${name} 应视为收工`)
+    assert.equal(out.nextWakeAtMs, undefined, `${name} 不应安排唤醒`)
+  }
+})
+
+function svc0(spec: Parameters<typeof makeService>[0], rec: Recorder) {
+  return makeService({ ...spec, recorder: rec })
+}
+
+test('唤醒余量与休眠上限是合理的常量', () => {
+  assert.ok(CLAIM_GRACE_MS >= 60_000, '余量至少 1 分钟，避免掐点被判未到达')
+  assert.ok(CLAIM_GRACE_MS <= 10 * 60_000, '余量不宜超过 10 分钟')
+  assert.ok(MAX_SLEEP_MS >= 60 * 60_000, '休眠上限至少 1 小时')
+  assert.ok(MAX_SLEEP_MS <= 24 * 60 * 60_000, '休眠上限不宜超过一天')
 })

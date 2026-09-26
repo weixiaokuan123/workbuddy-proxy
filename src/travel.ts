@@ -73,10 +73,35 @@ export interface TravelTickOutcome {
   message: string
   /** true = 今日该账号已无待办（已领/无 Buddy/达上限），当天不再重试 */
   done: boolean
+  /**
+   * 该账号「下一次需要被查看」的绝对时刻（ms），undefined = 无需再唤醒。
+   *
+   * 调度器据此把定时器设到真正需要的时刻，而不是固定间隔轮询：
+   *   - 行程中 → 到点时刻 + 领取余量
+   *   - 失败待重试 → 冷却截止时刻
+   *   - 今日收工 → 由调用方等到次日
+   */
+  nextWakeAtMs?: number
 }
 
 /** 未成功且值得重试时的冷却（10 分钟）：旅行是长周期动作，无需高频重试。 */
 export const RETRY_COOLDOWN_MS = 10 * 60 * 1000
+
+/**
+ * 到点后延迟多久去领奖（ms）。
+ *
+ * 服务端 `arrive_at` 按分钟取整，掐点去领有可能仍被判「尚未到达」，
+ * 故留 3 分钟余量。既不频繁轮询，也不为省 1 次请求而领取失败。
+ */
+export const CLAIM_GRACE_MS = 3 * 60 * 1000
+
+/**
+ * 单次休眠上限（ms）。
+ *
+ * 即便算出 4 小时后才到点，也最多睡 6 小时就跑一次：防止服务端状态异常
+ * （例如行程被取消、账号状态被外部改动）时程序睡死过去。
+ */
+export const MAX_SLEEP_MS = 6 * 60 * 60 * 1000
 
 export function localDate(d = new Date()): string {
   const y = d.getFullYear()
@@ -139,6 +164,19 @@ function syncFromStatus(entry: TravelState, status: WorkBuddyTravelStatus): void
   entry.state = status.state
 }
 
+/**
+ * 算出「到达时刻 + 余量」对应的绝对唤醒时刻（ms）。
+ *
+ * 用 `serverNow` 作参考点把服务端的相对差值换算成本地绝对时刻，
+ * 这样即使本机时钟与服务端有偏差，醒来时依然是对的时间点。
+ * 超过 {@link MAX_SLEEP_MS} 则截断，保证不会睡死。
+ */
+function wakeAtFromStatus(status: WorkBuddyTravelStatus, nowMs: number): number {
+  const leftSec = secondsUntilArrival(status)
+  if (leftSec <= 0) return nowMs + CLAIM_GRACE_MS
+  return nowMs + leftSec * 1000 + CLAIM_GRACE_MS
+}
+
 export class WorkBuddyTravelService {
   private readonly store: TravelCredentialStore
   private readonly client: WorkBuddyUpstreamClient
@@ -162,6 +200,7 @@ export class WorkBuddyTravelService {
    */
   async tick(entry: TravelState): Promise<TravelTickOutcome> {
     const credential = await this.store.resolve()
+    const nowMs = Date.now()
     const status = await this.client.fetchTravelStatus(credential)
 
     // 无 Buddy：官方 depart 必然返回 "no active buddy"，提前短路，不发无用请求。
@@ -169,15 +208,16 @@ export class WorkBuddyTravelService {
       syncFromStatus(entry, status)
       entry.state = 'idle'
       entry.done = true
-      entry.attemptedAtMs = Date.now()
+      entry.attemptedAtMs = nowMs
       const message = '无 Buddy，跳过旅行'
       entry.result = message
+      // 今日无事可做，交给调用方等到次日。
       return { acted: false, message, done: true }
     }
 
     // 服务端说今天已达上限：无论是 traveling 还是已被别处领掉，都不该再派。
     if (status.dailyLimitReached) {
-      return await this.finishWhenLimited(credential, entry, status)
+      return await this.finishWhenLimited(credential, entry, status, nowMs)
     }
 
     syncFromStatus(entry, status)
@@ -186,31 +226,36 @@ export class WorkBuddyTravelService {
       case 'traveling': {
         const left = secondsUntilArrival(status)
         if (left > 0) {
-          // 未到点：记下状态等下一轮，不碰上游任何写接口。
-          entry.attemptedAtMs = Date.now()
+          // 未到点：不碰上游任何写接口，直接算出「到点那一刻」再唤醒。
+          entry.attemptedAtMs = nowMs
           const message = `旅行中：${status.locationName || '路上'}（${minutesLeftText(left)}）`
           entry.result = message
-          return { acted: false, message, done: false }
+          return {
+            acted: false,
+            message,
+            done: false,
+            nextWakeAtMs: wakeAtFromStatus(status, nowMs),
+          }
         }
         // 已到点：服务端偶尔仍报 traveling，自行推进到领取。
         entry.state = 'arrived'
-        return await this.claim(credential, entry, status)
+        return await this.claim(credential, entry, status, nowMs)
       }
 
       case 'arrived':
-        return await this.claim(credential, entry, status)
+        return await this.claim(credential, entry, status, nowMs)
 
       case 'idle':
       default: {
         // 已派出过又回到 idle，且未达上限：可能是网页端领掉后重置，视为完成今日。
         if (entry.departed || entry.done) {
           entry.done = true
-          entry.attemptedAtMs = Date.now()
+          entry.attemptedAtMs = nowMs
           const message = '今日已完成'
           entry.result = message
           return { acted: false, message, done: true }
         }
-        return await this.depart(credential, entry)
+        return await this.depart(credential, entry, nowMs)
       }
     }
   }
@@ -225,42 +270,50 @@ export class WorkBuddyTravelService {
     credential: WorkBuddyCredential,
     entry: TravelState,
     status: WorkBuddyTravelStatus,
+    nowMs: number,
   ): Promise<TravelTickOutcome> {
     syncFromStatus(entry, status)
     entry.departed = true
 
-    const claimable = status.state !== 'idle' && status.recordId > 0 && secondsUntilArrival(status) <= 0
-    if (claimable) return await this.claim(credential, entry, status)
+    const left = secondsUntilArrival(status)
+    const claimable = status.state !== 'idle' && status.recordId > 0 && left <= 0
+    if (claimable) return await this.claim(credential, entry, status, nowMs)
 
-    entry.attemptedAtMs = Date.now()
+    entry.attemptedAtMs = nowMs
     if (status.state === 'idle') {
       entry.done = true
       const message = '今日已完成'
       entry.result = message
       return { acted: false, message, done: true }
     }
-    // 已派且在旅行中：今日没有待办（不会再派），但行程尚未结束，
-    // 下一轮仍需回来看一眼是否需要 claim，故 done=false。
+    // 已派且在旅行中：今日不会再派，但到点仍需领取一次。
     const message = `旅行中：${status.locationName || '路上'}（今日已派）`
     entry.result = message
-    return { acted: false, message, done: false }
+    return {
+      acted: false,
+      message,
+      done: false,
+      nextWakeAtMs: wakeAtFromStatus(status, nowMs),
+    }
   }
 
   /** 派猫出发：随机挑一个可用地点。 */
-  private async depart(credential: WorkBuddyCredential, entry: TravelState): Promise<TravelTickOutcome> {
+  private async depart(credential: WorkBuddyCredential, entry: TravelState, nowMs: number): Promise<TravelTickOutcome> {
     const config = await this.client.fetchTravelConfig(credential)
     const { locations } = config
     if (!config.enabled || locations.length === 0) {
-      entry.attemptedAtMs = Date.now()
+      entry.attemptedAtMs = nowMs
       const message = '无可用旅行地点'
       entry.result = message
-      return { acted: false, message, done: false }
+      // 地点配置是每日刷新的，1 小时后再看一眼即可。
+      entry.retryAfterMs = nowMs + RETRY_COOLDOWN_MS * 6
+      return { acted: false, message, done: false, nextWakeAtMs: nowMs + RETRY_COOLDOWN_MS * 6 }
     }
 
     // 随机选点，避免每次都去咖啡馆。
     const pick = locations[Math.floor(Math.random() * locations.length)] as WorkBuddyTravelLocation
     const result = await this.client.departTravel(credential, pick.id)
-    entry.attemptedAtMs = Date.now()
+    entry.attemptedAtMs = nowMs
 
     if (!result.ok) {
       // 服务端可能在两次请求之间已经派出（并发 / 网页端操作）：按已派出处理。
@@ -270,7 +323,12 @@ export class WorkBuddyTravelService {
         entry.departed = true
         const message = `已在旅行中：${status.locationName || pick.name}`
         entry.result = message
-        return { acted: true, message, done: false }
+        return {
+          acted: true,
+          message,
+          done: false,
+          nextWakeAtMs: wakeAtFromStatus(status, nowMs),
+        }
       }
       if (result.dailyLimitReached) {
         entry.departed = true
@@ -287,8 +345,8 @@ export class WorkBuddyTravelService {
       }
       const message = `派发失败：${result.message}`
       entry.result = message
-      entry.retryAfterMs = Date.now() + RETRY_COOLDOWN_MS
-      return { acted: true, message, done: false }
+      entry.retryAfterMs = nowMs + RETRY_COOLDOWN_MS
+      return { acted: true, message, done: false, nextWakeAtMs: entry.retryAfterMs }
     }
 
     // 派出成功：再查一次状态拿 arrive_at / record_id。
@@ -302,7 +360,7 @@ export class WorkBuddyTravelService {
     // 派出即达每日上限（实测），这里不下结论，等下一轮由 status 决定。
     const message = `已出发去「${place}」${left > 0 ? `（${minutesLeftText(left)}）` : ''}`
     entry.result = message
-    return { acted: true, message, done: false }
+    return { acted: true, message, done: false, nextWakeAtMs: wakeAtFromStatus(status, nowMs) }
   }
 
   /** 领奖。 */
@@ -310,6 +368,7 @@ export class WorkBuddyTravelService {
     credential: WorkBuddyCredential,
     entry: TravelState,
     status: WorkBuddyTravelStatus,
+    nowMs: number,
   ): Promise<TravelTickOutcome> {
     const recordId = status.recordId > 0 ? status.recordId : entry.recordId
     if (recordId <= 0) {
@@ -321,7 +380,7 @@ export class WorkBuddyTravelService {
     }
 
     const result = await this.client.claimTravel(credential, recordId)
-    entry.attemptedAtMs = Date.now()
+    entry.attemptedAtMs = nowMs
 
     if (!result.ok) {
       // 「没有可领的行程」= 已被网页端领走，或本就已领，算完成。
@@ -333,18 +392,18 @@ export class WorkBuddyTravelService {
         entry.result = message
         return { acted: true, message, done: true }
       }
-      // 「还没到」：下一轮再试。
+      // 「还没到」：说明 arrive_at 被服务端推后或本地算早了，等冷却后再试。
       if (result.notArrivedYet) {
         entry.state = 'arrived'
-        entry.retryAfterMs = Date.now() + RETRY_COOLDOWN_MS
+        entry.retryAfterMs = nowMs + RETRY_COOLDOWN_MS
         const message = '尚未到达，稍后重试'
         entry.result = message
-        return { acted: true, message, done: false }
+        return { acted: true, message, done: false, nextWakeAtMs: entry.retryAfterMs }
       }
       const message = `领奖失败：${result.message}`
       entry.result = message
-      entry.retryAfterMs = Date.now() + RETRY_COOLDOWN_MS
-      return { acted: true, message, done: false }
+      entry.retryAfterMs = nowMs + RETRY_COOLDOWN_MS
+      return { acted: true, message, done: false, nextWakeAtMs: entry.retryAfterMs }
     }
 
     entry.done = true
