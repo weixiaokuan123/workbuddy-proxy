@@ -9,7 +9,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { appendFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LiveCredentialStore } from './auth.ts'
@@ -53,6 +53,9 @@ const TRAVEL_ENABLED = (process.env['WORKBUDDY_TRAVEL'] ?? 'on') !== 'off'
 const TRAVEL_INITIAL_DELAY_MS = 90 * 1000
 // 全部账号都收工时的兜底轮询间隔（默认 6 小时，见 travel.ts 的 MAX_SLEEP_MS）。
 const TRAVEL_IDLE_POLL_MS = 6 * 60 * 60 * 1000
+// 两次唤醒之间的最小间隔：病态情况下（如时钟跳变）的洪泛兜底。
+// 正常唤醒点至少在 CLAIM_GRACE_MS（3 分钟）之后，故此下界不会推迟正常唤醒。
+const TRAVEL_MIN_WAKE_MS = 30 * 1000
 
 /** 账号模式端口段：账号 i 使用 BASE + i（39320 起）。 */
 const ACCOUNT_PORT_BASE = Number(process.env['WORKBUDDY_ACCOUNT_PORT_BASE'] ?? 39320)
@@ -157,8 +160,16 @@ function writeLogSink(sink: LogSink, text: string): void {
       // 轮转失败就继续往当前文件追加：丢日志比不轮转更糟
     }
   }
-  appendFileSync(sink.path, text, 'utf8')
-  sink.size += bytes
+  // 追加同样必须包 try：磁盘满 / 日志被独占锁定时 appendFileSync 会同步抛错。
+  // 落盘失败绝不能往上传播——本函数常被 catch 块内的 logger.warn 调用，
+  // 异常一旦逃出去就成了未捕获 rejection，而 Node 24 的默认行为是**终止进程**，
+  // 会连带干掉正在给编辑器供模的端点。日志写不进去，丢掉这一条，仅此而已。
+  try {
+    appendFileSync(sink.path, text, 'utf8')
+    sink.size += bytes
+  } catch {
+    // 静默：日志不是关键路径，不能因为它把服务搞挂
+  }
 }
 
 const LOG_OUT = makeLogSink('WORKBUDDY_PROXY_LOG_OUT')
@@ -504,10 +515,16 @@ async function main(): Promise<void> {
       }
 
       const saveTravelState = async (): Promise<void> => {
+        // 走 tmp + rename：崩溃或磁盘满时不会留下被截断的 JSON
+        // （与 AccountStore.save 同一套做法）。真留下截断文件也不致命——
+        // 读回时 try/catch 会退回空状态，下轮重新读 status 由服务端 daily_limit 兜住。
+        const tmp = `${TRAVEL_STATE_FILE}.tmp`
         try {
-          await writeFile(TRAVEL_STATE_FILE, JSON.stringify(travelStoreData, null, 2), { mode: 0o600 })
+          await writeFile(tmp, `${JSON.stringify(travelStoreData, null, 2)}\n`, { mode: 0o600 })
+          await rename(tmp, TRAVEL_STATE_FILE)
         } catch (error) {
           logger.warn('旅行状态写入失败：', error instanceof Error ? error.message : String(error))
+          await rm(tmp, { force: true }).catch(() => {})
         }
       }
 
@@ -532,7 +549,13 @@ async function main(): Promise<void> {
           // 今日已完成：整轮跳过，不向上游发任何请求。
           if (entry.done) { nextWakeAt.delete(t.id); continue }
           // 失败冷却中：跳过，避免抖动时持续打上游。
-          if (entry.retryAfterMs !== undefined && nowMs < entry.retryAfterMs) continue
+          // 必须把冷却截止时刻登记为唤醒点：否则本账号在 nextWakeAt 里缺席，
+          // 一旦所有账号都处于冷却，定时器会退化成 6 小时兜底，
+          // 把一个「2 分钟后就能重试」的任务睡过头。
+          if (entry.retryAfterMs !== undefined && nowMs < entry.retryAfterMs) {
+            nextWakeAt.set(t.id, entry.retryAfterMs)
+            continue
+          }
 
           try {
             const outcome = await t.travel.tick(entry)
@@ -561,6 +584,24 @@ async function main(): Promise<void> {
         scheduleNextWake()
       }
 
+      /**
+       * 触发一轮旅行推进。
+       *
+       * 刻意吞掉异常：`void promise` 一旦产生未捕获的 rejection，Node 24 的
+       * 默认行为是**直接终止进程**——而这个进程正承载着编辑器用的模型端点，
+       * 绝不能因为一次旅行的小故障就整体退出。catch 里再补一次重排，
+       * 保证即便某一轮炸了，后续仍会继续推进。
+       */
+      const runTravelTick = (): void => {
+        travelTick().catch((error: unknown) => {
+          logger.warn(
+            '旅行调度异常（已忽略，不影响服务）：',
+            error instanceof Error ? error.message : String(error),
+          )
+          try { scheduleNextWake() } catch { /* 连重排都失败就不再挣扎 */ }
+        })
+      }
+
       /** 按所有账号里最早的那个时刻重排定时器。 */
       const scheduleNextWake = (): void => {
         if (travelTimer !== undefined) { clearTimeout(travelTimer); travelTimer = undefined }
@@ -570,17 +611,20 @@ async function main(): Promise<void> {
         }
         const now = Date.now()
         // 全部收工：睡满一整段再整体看一眼（跨天重置由 rollTravelStateToToday 兜住）。
+        // 下界 30 秒是洪泛兜底：正常唤醒点至少在 3 分钟后（见 CLAIM_GRACE_MS），
+        // 这个下界不会推迟任何一次正常唤醒，只用于挡住时钟跳变等病态情况下的
+        // 「每 1 秒醒一次」——那会在每轮里对每个未完成账号各打一次上游。
         const delay = earliest === undefined
           ? TRAVEL_IDLE_POLL_MS
-          : Math.min(Math.max(earliest - now, 1_000), MAX_TRAVEL_SLEEP_MS)
-        travelTimer = setTimeout(() => { void travelTick() }, delay)
+          : Math.min(Math.max(earliest - now, TRAVEL_MIN_WAKE_MS), MAX_TRAVEL_SLEEP_MS)
+        travelTimer = setTimeout(() => { runTravelTick() }, delay)
         travelTimer.unref()
         logger.info(`旅行下次检查：${new Date(now + delay).toLocaleString('zh-CN')}（${Math.round(delay / 60000)} 分钟后）`)
       }
 
       // 延迟一小会儿再跑首轮：避免在启动过程中抢上游，同时抓住
       // 「昨天派出、今天已到点可领」的情况（与签到的初始延迟同一思路）。
-      setTimeout(() => { void travelTick() }, TRAVEL_INITIAL_DELAY_MS).unref()
+      setTimeout(() => { runTravelTick() }, TRAVEL_INITIAL_DELAY_MS).unref()
       logger.info(`派猫猫旅行已启用：按到点时刻精确唤醒，不做固定轮询（${travelTargets.length} 个国内版账号）`)
     }
   }

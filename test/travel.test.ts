@@ -24,7 +24,7 @@ import {
   CLAIM_GRACE_MS,
   MAX_SLEEP_MS,
 } from '../src/travel.ts'
-import type { WorkBuddyTravelStatus } from '../src/upstream.ts'
+import { WorkBuddyUpstreamClient, type WorkBuddyTravelStatus } from '../src/upstream.ts'
 
 /** 记录写接口调用次数，断言「不该写的时候一个都没写」。 */
 interface Recorder {
@@ -334,4 +334,47 @@ test('唤醒余量与休眠上限是合理的常量', () => {
   assert.ok(CLAIM_GRACE_MS <= 10 * 60_000, '余量不宜超过 10 分钟')
   assert.ok(MAX_SLEEP_MS >= 60 * 60_000, '休眠上限至少 1 小时')
   assert.ok(MAX_SLEEP_MS <= 24 * 60 * 60_000, '休眠上限不宜超过一天')
+})
+
+test('超长的上游错误文案被截断（真实 departTravel 路径）', async () => {
+  // envelope.msg 是服务端可控字符串；不截断就能被灌进日志与 travel-state.json。
+  // 这里替换全局 fetch 来驱动**真实的** departTravel——用假 client 测不到截断，
+  // 因为截断发生在 client 内部。
+  const huge = 'x'.repeat(50_000)
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ code: 400, msg: huge, data: null }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )) as typeof fetch
+
+  try {
+    const client = new WorkBuddyUpstreamClient()
+    const cred = { accessToken: 't', refreshToken: 'r', expiresAtMs: 0, domain: 'www.codebuddy.cn', uid: 'u' }
+    const result = await client.departTravel(cred as never, 1)
+
+    assert.equal(result.ok, false)
+    assert.ok(
+      result.message.length <= 201,
+      `错误文案应被截断到 200 字符左右，实际 ${result.message.length}`,
+    )
+    assert.ok(result.message.endsWith('…'), '截断后应有省略标记')
+    assert.ok(!result.message.includes('x'.repeat(1000)), '不得原样保留超长内容')
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('超长错误文案经过 tick 后不会撑大状态文件', async () => {
+  // 上游层已截断，这里确认 travel 层不会把它再放大写盘。
+  const capped = `${'x'.repeat(200)}…`
+  const rec = fresh()
+  const svc = makeService({
+    status: statusOf({ state: 'idle' }),
+    depart: { ok: false, already: false, dailyLimitReached: false, noBuddy: false, message: capped, code: 400 },
+    recorder: rec,
+  })
+  const entry = createTravelState('2026-09-26')
+  await svc.tick(entry)
+
+  assert.ok((entry.result ?? '').length < 500, '状态文件里的文案应保持有界')
 })
