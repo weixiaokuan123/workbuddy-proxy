@@ -17,10 +17,18 @@ import { AccountCredentialStore } from './account-store.ts'
 import { AccountStore, dropLiveDuplicates, identityKeysOfCredential, regionOfDomain, type StoredAccount } from './accounts.ts'
 import { WorkBuddyCatalog } from './catalog.ts'
 import { createWorkBuddyShim, RateLimitRegistry, type CredentialStoreLike, type WorkBuddyShim, type ShimLogger } from './shim.ts'
-import { WorkBuddyUpstreamClient, type WorkBuddyRegion } from './upstream.ts'
+import { WorkBuddyUpstreamClient, travelSupported, type WorkBuddyRegion } from './upstream.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { WorkBuddySigninService } from './signin.ts'
 import { SigninScheduler, formatSec } from './scheduler.ts'
+import {
+  WorkBuddyTravelService,
+  createTravelState,
+  rollTravelStateToToday,
+  localDate as travelLocalDate,
+  RETRY_COOLDOWN_MS as TRAVEL_RETRY_COOLDOWN_MS,
+  type TravelStateStore,
+} from './travel.ts'
 
 import { redactPaths } from './redact.ts'
 
@@ -29,12 +37,20 @@ const ROOT = dirname(HERE)
 const KEYS_DIR = join(ROOT, 'keys')
 const STATE_DIR = join(ROOT, 'state')
 const ACCOUNTS_FILE = join(STATE_DIR, 'accounts.json')
+const TRAVEL_STATE_FILE = join(STATE_DIR, 'travel-state.json')
 
 const SIGNIN_ENABLED = (process.env['WORKBUDDY_SIGNIN'] ?? 'on') !== 'off'
 const SIGNIN_START_HOUR = Number(process.env['WORKBUDDY_SIGNIN_START_HOUR'] ?? 7)
 const SIGNIN_END_HOUR = Number(process.env['WORKBUDDY_SIGNIN_END_HOUR'] ?? 10)
 const SIGNIN_TICK_MS = 5 * 60 * 1000
 const SIGNIN_INITIAL_DELAY_MS = 60 * 1000
+
+// ---- 派猫猫旅行（成长中心） ----
+// 只有国内版有成长中心；国际版账号一律跳过（见 travelSupported）。
+const TRAVEL_ENABLED = (process.env['WORKBUDDY_TRAVEL'] ?? 'on') !== 'off'
+// 行程最短 1 小时，10 分钟一轮足够及时领取，且不会给上游压力。
+const TRAVEL_TICK_MS = 10 * 60 * 1000
+const TRAVEL_INITIAL_DELAY_MS = 90 * 1000
 
 /** 账号模式端口段：账号 i 使用 BASE + i（39320 起）。 */
 const ACCOUNT_PORT_BASE = Number(process.env['WORKBUDDY_ACCOUNT_PORT_BASE'] ?? 39320)
@@ -450,6 +466,87 @@ async function main(): Promise<void> {
     logger.info(`每日签到已启用：本地 ${SIGNIN_START_HOUR}:00–${SIGNIN_END_HOUR}:00 随机时刻自动领取（${signinTargets.length} 个账号独立）`)
   }
 
+  // ---- 派猫猫旅行（成长中心，仅国内版） ----
+  // 与签到的差别：旅行是两阶段状态机，需要记住 record_id / 到点时间，
+  // 故状态单独存 state/travel-state.json，由本进程按固定间隔轮询推进。
+  let travelTimer: NodeJS.Timeout | undefined
+  if (TRAVEL_ENABLED) {
+    await mkdir(STATE_DIR, { recursive: true, mode: 0o700 })
+    const travelTargets: Array<{ id: string; label: string; travel: WorkBuddyTravelService }> = []
+    for (const rt of runtimes) {
+      // 只有国内版有成长中心；国际版连请求都不发。
+      if (rt.accountKey === undefined && travelSupported(rt.region)) {
+        travelTargets.push({ id: rt.id, label: rt.label, travel: new WorkBuddyTravelService(rt.store, client) })
+      }
+    }
+    if (!ACCOUNT_PORTS_ENABLED) {
+      for (const a of accountStores) {
+        if (!travelSupported(a.region)) continue
+        travelTargets.push({
+          id: a.id,
+          label: a.label,
+          travel: new WorkBuddyTravelService(a.store, client),
+        })
+      }
+    }
+
+    if (travelTargets.length > 0) {
+      let travelStoreData: TravelStateStore = {}
+      try {
+        const raw = JSON.parse(await readFile(TRAVEL_STATE_FILE, 'utf8')) as unknown
+        if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+          travelStoreData = raw as TravelStateStore
+        }
+      } catch {
+        // 首次运行或文件损坏：从空状态开始，今天重来一次即可（幂等）。
+      }
+
+      const saveTravelState = async (): Promise<void> => {
+        try {
+          await writeFile(TRAVEL_STATE_FILE, JSON.stringify(travelStoreData, null, 2), { mode: 0o600 })
+        } catch (error) {
+          logger.warn('旅行状态写入失败：', error instanceof Error ? error.message : String(error))
+        }
+      }
+
+      const travelTick = async (): Promise<void> => {
+        const today = travelLocalDate()
+        let dirty = false
+        for (const t of travelTargets) {
+          const entry = rollTravelStateToToday(travelStoreData[t.id] ?? createTravelState(today), today)
+          travelStoreData[t.id] = entry
+
+          // 今日已完成：整轮跳过，不向上游发任何请求。
+          if (entry.done) continue
+          // 失败冷却中：跳过，避免抖动时持续打上游。
+          if (entry.retryAfterMs !== undefined && Date.now() < entry.retryAfterMs) continue
+
+          try {
+            const outcome = await t.travel.tick(entry)
+            dirty = true
+            if (outcome.acted) logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}`)
+            else if (outcome.done) logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}`)
+          } catch (error) {
+            dirty = true
+            entry.attemptedAtMs = Date.now()
+            entry.retryAfterMs = Date.now() + TRAVEL_RETRY_COOLDOWN_MS
+            const message = `旅行出错：${error instanceof Error ? error.message : String(error)}`
+            entry.result = message
+            logger.warn(`workbuddy(${t.label}) ${message}`)
+          }
+        }
+        if (dirty) await saveTravelState()
+      }
+
+      // 延迟一小会儿再跑首轮：避免在启动过程中抢上游，同时抓住
+      // 「昨天派出、今天已到点可领」的情况（与签到的初始延迟同一思路）。
+      setTimeout(() => { void travelTick() }, TRAVEL_INITIAL_DELAY_MS).unref()
+      travelTimer = setInterval(() => { void travelTick() }, TRAVEL_TICK_MS)
+      travelTimer.unref()
+      logger.info(`派猫猫旅行已启用：每 ${TRAVEL_TICK_MS / 60000} 分钟推进一次（${travelTargets.length} 个国内版账号）`)
+    }
+  }
+
   // 每 6 小时刷新一次模型目录
   const REFRESH_INTERVAL = 6 * 60 * 60 * 1000
   const timer = setInterval(() => {
@@ -474,6 +571,7 @@ async function main(): Promise<void> {
     logger.info(`收到 ${signal}，正在关闭...`)
     clearInterval(timer)
     if (signinTimer !== undefined) clearInterval(signinTimer)
+    if (travelTimer !== undefined) clearInterval(travelTimer)
     await Promise.allSettled(shims.map(shim => shim.close()))
     process.exit(0)
   }

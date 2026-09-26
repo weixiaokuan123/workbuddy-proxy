@@ -110,6 +110,62 @@ export interface WorkBuddyCheckinClaim {
   isStreakDay: boolean
 }
 
+/** One place the cat can travel to (growth-center travel config). */
+export interface WorkBuddyTravelLocation {
+  id: number
+  code: string
+  name: string
+}
+
+/** Travel config answer: the place list and whether the activity is open. */
+export interface WorkBuddyTravelConfig {
+  enabled: boolean
+  locations: readonly WorkBuddyTravelLocation[]
+}
+
+/**
+ * Growth-center travel state for one account.
+ *
+ * The three time fields are the platform's OWN naive timestamps, NOT Unix
+ * seconds — measured `arrive_at ≈ 1.79e9` while real Unix seconds were
+ * `≈ 1.79e9 / 1000`-scale off by three orders of magnitude. Only ever use
+ * their DIFFERENCES (`arriveAt - serverNow`); never compare them against the
+ * local clock.
+ */
+export interface WorkBuddyTravelStatus {
+  /** `idle` = 可派；`traveling` = 在路上；`arrived` = 可领奖 */
+  state: 'idle' | 'traveling' | 'arrived'
+  /** 0 = 该账号没有 Buddy，旅行不可用 */
+  buddyId: number
+  recordId: number
+  locationName: string
+  /** 平台内部时间戳（非 Unix 秒），只用于与 serverNow 做差 */
+  departAt: number
+  /** 平台内部时间戳（非 Unix 秒），只用于与 serverNow 做差 */
+  arriveAt: number
+  /**
+   * True once today's single trip has been dispatched — set even while
+   * `state` is still `traveling`. Treat as "no more depart today".
+   */
+  dailyLimitReached: boolean
+  /** 平台内部「当前时刻」，只用于与 arriveAt 做差 */
+  serverNow: number
+  /** 本次行程预计时长（小时） */
+  durationHours: number
+  /** 预计/实际奖励积分 */
+  rewardCredit: number
+}
+
+/** Travel depart answer; `ok: false` carries a classified reason. */
+export type WorkBuddyTravelDepartResult =
+  | { ok: true; state: string }
+  | { ok: false; already: boolean; dailyLimitReached: boolean; noBuddy: boolean; message: string; code: number }
+
+/** Travel claim answer. */
+export type WorkBuddyTravelClaimResult =
+  | { ok: true; rewardCredit: number | null }
+  | { ok: false; nothingToClaim: boolean; notArrivedYet: boolean; message: string; code: number }
+
 /** Token refresh answer; fields the upstream omits stay absent. */
 export interface WorkBuddyRefreshOutcome {
   accessToken: string
@@ -299,6 +355,50 @@ function commonHeaders(credential: WorkBuddyCredential): Record<string, string> 
     'Referer': `${originReferer(credential)}/`,
     'User-Agent': CLIENT_UA,
   }
+}
+
+/**
+ * API base for the growth-centre (travel) service.
+ *
+ * Unlike billing, travel hangs DIRECTLY off the CN API domain with no `/v2`
+ * prefix (see the upstream project's `TRAVEL_API_PREFIX`). The two global
+ * hosts reject this path with a gateway 401 — the growth centre only exists on
+ * the CN build, which is why {@link travelSupported} gates on the region.
+ */
+const CN_TRAVEL_BASE = 'https://www.codebuddy.cn'
+const TRAVEL_API_PREFIX = '/activity/growth/buddy/travel'
+
+/**
+ * User agent of the growth-centre web page.
+ *
+ * The travel endpoints sit behind the same gateway as billing but are reached
+ * from the *web* console rather than the CLI. The `x-client-platform: web`
+ * marker plus a growth-centre `Referer` are what make the gateway route the
+ * request at all — without them every travel call 404s even on the CN host.
+ */
+const TRAVEL_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+
+/**
+ * Headers for growth-centre (travel) requests.
+ *
+ * Deliberately built on top of the billing header set: the identity headers
+ * (`X-User-Id` / `X-Enterprise-Id` / `X-Domain`) are the same, and only the
+ * web-console markers and Referer differ.
+ */
+function travelHeaders(credential: WorkBuddyCredential): Record<string, string> {
+  return {
+    ...billingHeaders(credential),
+    'x-client-platform': 'web',
+    'Origin': CN_TRAVEL_BASE,
+    'Referer': `${CN_TRAVEL_BASE}/profile/growth-center`,
+    'User-Agent': TRAVEL_UA,
+  }
+}
+
+/** The growth centre (and therefore travel) only exists on the CN region. */
+export function travelSupported(region: WorkBuddyRegion): boolean {
+  return region === 'cn'
 }
 
 /** Chat request headers, including the X-No-* conventions the official CLI uses. */
@@ -721,6 +821,142 @@ export class WorkBuddyUpstreamClient {
       ...typeof data['claim_button_text'] === 'string' && data['claim_button_text'] !== ''
         ? { claimButtonText: data['claim_button_text'] }
         : {},
+    }
+  }
+
+  /**
+   * Growth-centre travel: read the place list.
+   *
+   * GET, not POST — the travel endpoints are plain REST (unlike billing's
+   * POST-everything convention).
+   */
+  async fetchTravelConfig(credential: WorkBuddyCredential): Promise<WorkBuddyTravelConfig> {
+    const response = await fetch(`${CN_TRAVEL_BASE}${TRAVEL_API_PREFIX}/config`, {
+      method: 'GET',
+      headers: travelHeaders(credential),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const rawLocations = Array.isArray(data['locations']) ? data['locations'] : []
+    const locations: WorkBuddyTravelLocation[] = []
+    for (const raw of rawLocations) {
+      if (typeof raw !== 'object' || raw === null) continue
+      const item = raw as Record<string, unknown>
+      const id = typeof item['id'] === 'number' ? item['id'] : 0
+      if (id === 0) continue
+      locations.push({
+        id,
+        code: typeof item['code'] === 'string' ? item['code'] : '',
+        name: typeof item['name'] === 'string' ? item['name'] : '',
+      })
+    }
+    return {
+      // The upstream `enabled` flag defaults to true; an empty list is the
+      // practical "nothing to do" signal, so require both.
+      enabled: data['enabled'] !== false && locations.length > 0,
+      locations,
+    }
+  }
+
+  /** Growth-centre travel: current state for this account. */
+  async fetchTravelStatus(credential: WorkBuddyCredential): Promise<WorkBuddyTravelStatus> {
+    const response = await fetch(`${CN_TRAVEL_BASE}${TRAVEL_API_PREFIX}/status`, {
+      method: 'GET',
+      headers: travelHeaders(credential),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const numberField = (key: string): number => typeof data[key] === 'number' ? data[key] as number : 0
+    const location = typeof data['location'] === 'object' && data['location'] !== null
+      ? data['location'] as Record<string, unknown>
+      : {}
+    // Unknown / missing state degrades to `idle`, which the caller treats as
+    // "may depart". Acceptable here (unlike the sign-in path) because a depart
+    // against a real trip is answered by the server with `already traveling`.
+    const rawState = typeof data['state'] === 'string' ? data['state'] : ''
+    const state: WorkBuddyTravelStatus['state'] = rawState === 'traveling' || rawState === 'arrived'
+      ? rawState
+      : 'idle'
+    return {
+      state,
+      buddyId: numberField('buddy_id'),
+      recordId: numberField('record_id'),
+      locationName: typeof location['name'] === 'string' ? location['name'] : '',
+      departAt: numberField('depart_at'),
+      arriveAt: numberField('arrive_at'),
+      dailyLimitReached: data['daily_limit_reached'] === true,
+      serverNow: numberField('server_now'),
+      durationHours: numberField('duration_hours'),
+      rewardCredit: numberField('reward_credit'),
+    }
+  }
+
+  /**
+   * Growth-centre travel: send the cat out.
+   *
+   * Returns a classified failure instead of throwing for the expected business
+   * rejections (`no active buddy` / `daily limit` / `already traveling`), which
+   * the scheduler uses as state transitions rather than errors.
+   */
+  async departTravel(credential: WorkBuddyCredential, locationId: number): Promise<WorkBuddyTravelDepartResult> {
+    const response = await fetch(`${CN_TRAVEL_BASE}${TRAVEL_API_PREFIX}/depart`, {
+      method: 'POST',
+      headers: travelHeaders(credential),
+      body: JSON.stringify({ location_id: locationId }),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (response.ok && envelope.code === 0) {
+      const data = typeof envelope.data === 'object' && envelope.data !== null
+        ? envelope.data as Record<string, unknown>
+        : {}
+      return { ok: true, state: typeof data['state'] === 'string' ? data['state'] : 'traveling' }
+    }
+    const message = envelope.msg !== '' ? envelope.msg : `http ${response.status}`
+    const lower = message.toLowerCase()
+    return {
+      ok: false,
+      already: lower.includes('already traveling'),
+      dailyLimitReached: lower.includes('daily limit') || lower.includes('daily_limit'),
+      noBuddy: lower.includes('no active buddy'),
+      message,
+      code: envelope.code !== 0 ? envelope.code : response.status,
+    }
+  }
+
+  /** Growth-centre travel: collect the reward once the cat has arrived. */
+  async claimTravel(credential: WorkBuddyCredential, recordId: number): Promise<WorkBuddyTravelClaimResult> {
+    const response = await fetch(`${CN_TRAVEL_BASE}${TRAVEL_API_PREFIX}/claim`, {
+      method: 'POST',
+      headers: travelHeaders(credential),
+      body: JSON.stringify(recordId > 0 ? { record_id: recordId } : {}),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (response.ok && envelope.code === 0) {
+      const data = typeof envelope.data === 'object' && envelope.data !== null
+        ? envelope.data as Record<string, unknown>
+        : {}
+      const raw = data['reward_credit']
+      const rewardCredit = typeof raw === 'number' ? raw : null
+      return { ok: true, rewardCredit }
+    }
+    const message = envelope.msg !== '' ? envelope.msg : `http ${response.status}`
+    const lower = message.toLowerCase()
+    return {
+      ok: false,
+      nothingToClaim: lower.includes('no unclaimed travel') || lower.includes('daily_limit'),
+      notArrivedYet: lower.includes('not arrived yet'),
+      message,
+      code: envelope.code !== 0 ? envelope.code : response.status,
     }
   }
 
