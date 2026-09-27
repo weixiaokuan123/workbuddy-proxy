@@ -158,6 +158,52 @@ function isENOENT(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT'
 }
 
+/** 从 auth 文档里能读出的身份信息（不含任何凭据）。 */
+export interface WorkBuddyLiveIdentity {
+  uid: string
+  uin: string
+  domain: string
+}
+
+/**
+ * 只读身份，**不解密也不要求 token 可读**。
+ *
+ * 存在的理由：桌面端（2026-09 起）把 `auth.accessToken` / `refreshToken` 改成
+ * `{$wbEncrypted, envelope}` 的加密对象，`parseWorkBuddyAuth` 因此返回 undefined，
+ * 于是 live 运行时被判定为「未登录」。但 `account.uid` / `account.uin` / `sso.domain`
+ * **仍是明文**——身份信息拿得到，只有凭据拿不到。
+ *
+ * 有了它，去重就能按真实身份进行：即便 live 的 token 解不开，也知道
+ * 「live 就是账号库里那个 13800138002」，于是可以自动用账号库那份顶上，
+ * 而不是稀里糊涂地以为该区域没有 live 身份。
+ */
+export function readLiveIdentity(text: string): WorkBuddyLiveIdentity | undefined {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+  const document = parsed as Record<string, unknown>
+  const account = typeof document['account'] === 'object' && document['account'] !== null
+    ? document['account'] as Record<string, unknown>
+    : document
+  const auth = typeof document['auth'] === 'object' && document['auth'] !== null
+    ? document['auth'] as Record<string, unknown>
+    : {}
+  const sso = typeof account['sso'] === 'object' && account['sso'] !== null
+    ? account['sso'] as Record<string, unknown>
+    : {}
+  const domain = optionalString(auth['domain'])
+    ?? optionalString(sso['domain'])
+    ?? ''
+  const uid = optionalString(account['uid']) ?? ''
+  const uin = optionalString(account['uin']) ?? ''
+  if (uid === '' && uin === '' && domain === '') return undefined
+  return { uid, uin, domain }
+}
+
 /**
  * 候选 live 文件的组合签名（每个文件 mtimeMs + size）。
  * 任一候选被创建/改写/删除都会改变签名，据此决定是否重读；不使用固定 TTL。
@@ -267,8 +313,27 @@ export class LiveCredentialStore {
   async resolve(): Promise<WorkBuddyCredential> {
     const live = await this.readLive()
     if (live === undefined) {
+      // 区分两种完全不同的原因，否则会误导排查方向：
+      //   文件真的不在   → 没登录，让用户去登录
+      //   文件在但读不出凭据 → 桌面端把 token 加密了（2026-09 起），登录其实没问题
+      const path = this.livePath()
+      let present = false
+      try {
+        const identity = readLiveIdentity(await readFile(path, 'utf8'))
+        present = identity !== undefined
+      } catch {
+        present = false
+      }
+      if (present) {
+        // 面向面板的文案必须**短**：这段会原样出现在 agent-hub 的卡片上，
+        // 写长了会把卡片撑爆。完整解释走启动时那条 warn 日志。
+        throw new Error(
+          `登录态 token 已加密（桌面端 2026-09 起），暂不能解密；`
+          + `账号本身正常，已自动改用账号库中同身份账号（${redactPaths(path)}）`,
+        )
+      }
       throw new Error(
-        `workbuddy(${this.region}): 未找到登录态文件 ${this.livePath()}；`
+        `workbuddy(${this.region}): 未找到登录态文件 ${path}；`
         + `请先在对应区域的 WorkBuddy 桌面端登录，或用 ${AUTH_FILE_ENV[this.region]} 指定文件路径`,
       )
     }

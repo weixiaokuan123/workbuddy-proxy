@@ -145,6 +145,17 @@ export interface WorkBuddyShimOptions {
   /** 立即检查/领取今日签到（幂等） */
   signinClaim?: () => Promise<unknown>
   /**
+   * 只读旅行视图；不提供则 /travel/* 返回 404。
+   *
+   * 刻意**只读本地状态、不打上游**：面板轮询很频繁，打上游既慢又会撞限流。
+   */
+  travelStatus?: () => unknown
+  /**
+   * 手动派遣。`onlyId` 为空表示对该端口下所有可派账号各派一次。
+   * 重复点击由服务端 daily_limit 吸收，这里只如实转述逐账号结果。
+   */
+  travelDepart?: (onlyId?: string) => Promise<unknown>
+  /**
    * 限流切换：返回**同区域**的全部候选（含本端口自身），由 shim 决定尝试顺序。
    * 不提供则退化为单账号行为（遇限流直接报错）。
    */
@@ -326,6 +337,30 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         if (!options.signinClaim) { writeOpenAIError(res, 404, 'not_found', '签到功能不可用'); return }
         try { writeJson(res, 200, await options.signinClaim()); return }
         catch (error) { writeOpenAIError(res, 502, 'signin_error', error instanceof Error ? error.message : String(error)); return }
+      }
+      if (url.split('?')[0] === '/travel/status' && req.method === 'GET') {
+        if (!options.travelStatus) { writeOpenAIError(res, 404, 'not_found', '旅行功能不可用'); return }
+        try { writeJson(res, 200, options.travelStatus()); return }
+        catch (error) { writeOpenAIError(res, 502, 'travel_error', error instanceof Error ? error.message : String(error)); return }
+      }
+      if (url.split('?')[0] === '/travel/depart' && req.method === 'POST') {
+        if (!options.travelDepart) { writeOpenAIError(res, 404, 'not_found', '旅行功能不可用'); return }
+        let onlyId: string | undefined
+        try {
+          const raw = (await readBody(req)).toString('utf8')
+          if (raw.trim() !== '') {
+            const parsed = JSON.parse(raw) as unknown
+            // 只接受字符串 id；其它类型一律当作「全部派遣」，不猜。
+            if (typeof parsed === 'object' && parsed !== null) {
+              const id = (parsed as Record<string, unknown>)['id']
+              if (typeof id === 'string' && id !== '') onlyId = id
+            }
+          }
+        } catch {
+          // body 解析失败：按「全部派遣」处理，服务端会逐账号说明原因。
+        }
+        try { writeJson(res, 200, await options.travelDepart(onlyId)); return }
+        catch (error) { writeOpenAIError(res, 502, 'travel_error', error instanceof Error ? error.message : String(error)); return }
       }
       if (req.method === 'POST' && (url === '/v1/chat/completions' || url === '/v1/chat/completions/')) {
         await chatCompletions(req, res)

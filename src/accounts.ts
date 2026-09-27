@@ -127,8 +127,13 @@ export class AccountStore {
     this.file = file
   }
 
-  /** 文件签名：mtimeMs + size；文件缺失返回 undefined。 */
-  private async signature(): Promise<string | undefined> {
+  /**
+   * 文件签名：mtimeMs + size；文件缺失返回 undefined。
+   *
+   * 公开供外部的低频巡检使用：只 `stat` 不读盘（零上游请求），
+   * 用来判断账号库有没有变——变了才需要重建旅行目标等派生结构。
+   */
+  async signature(): Promise<string | undefined> {
     try {
       const info = await stat(this.file)
       return `${info.mtimeMs}:${info.size}`

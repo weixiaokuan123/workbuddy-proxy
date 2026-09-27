@@ -12,9 +12,9 @@ import { appendFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { LiveCredentialStore } from './auth.ts'
+import { LiveCredentialStore, readLiveIdentity } from './auth.ts'
 import { AccountCredentialStore } from './account-store.ts'
-import { AccountStore, dropLiveDuplicates, identityKeysOfCredential, regionOfDomain, type StoredAccount } from './accounts.ts'
+import { AccountStore, dropLiveDuplicates, identityKeysOfCredential, identityKeysOfRecord, regionOfDomain, type StoredAccount } from './accounts.ts'
 import { WorkBuddyCatalog } from './catalog.ts'
 import { createWorkBuddyShim, RateLimitRegistry, type CredentialStoreLike, type WorkBuddyShim, type ShimLogger } from './shim.ts'
 import { WorkBuddyUpstreamClient, travelSupported, type WorkBuddyRegion } from './upstream.ts'
@@ -26,8 +26,10 @@ import {
   createTravelState,
   rollTravelStateToToday,
   localDate as travelLocalDate,
-  RETRY_COOLDOWN_MS as TRAVEL_RETRY_COOLDOWN_MS,
+  BACKOFF_LADDER_MS as TRAVEL_BACKOFF,
   MAX_SLEEP_MS as MAX_TRAVEL_SLEEP_MS,
+  DEFAULT_TRAVEL_WINDOW,
+  type TravelWindow,
   type TravelStateStore,
 } from './travel.ts'
 
@@ -49,13 +51,24 @@ const SIGNIN_INITIAL_DELAY_MS = 60 * 1000
 // ---- 派猫猫旅行（成长中心） ----
 // 只有国内版有成长中心；国际版账号一律跳过（见 travelSupported）。
 const TRAVEL_ENABLED = (process.env['WORKBUDDY_TRAVEL'] ?? 'on') !== 'off'
-// 启动后延迟多久跑第一轮：避开启动过程，再顺手接住「昨天派出、今天可领」。
-const TRAVEL_INITIAL_DELAY_MS = 90 * 1000
-// 全部账号都收工时的兜底轮询间隔（默认 6 小时，见 travel.ts 的 MAX_SLEEP_MS）。
-const TRAVEL_IDLE_POLL_MS = 6 * 60 * 60 * 1000
 // 两次唤醒之间的最小间隔：病态情况下（如时钟跳变）的洪泛兜底。
 // 正常唤醒点至少在 CLAIM_GRACE_MS（3 分钟）之后，故此下界不会推迟正常唤醒。
 const TRAVEL_MIN_WAKE_MS = 30 * 1000
+// 账号库巡检间隔：只 stat 文件（零上游请求），mtime 变了才重建目标集合。
+const TRAVEL_SWEEP_MS = 5 * 60 * 1000
+// 「全部派遣」时账号间的错开间隔，避免集中打上游触发 QPS 限流。
+const TRAVEL_DEPART_STAGGER_MS = 2 * 1000
+// 可派时间窗（服务端本地小时）。窗外不派，领取不受影响。
+const travelWindow: TravelWindow = {
+  startHour: Number(process.env['WORKBUDDY_TRAVEL_WINDOW_START'] ?? DEFAULT_TRAVEL_WINDOW.startHour),
+  endHour: Number(process.env['WORKBUDDY_TRAVEL_WINDOW_END'] ?? DEFAULT_TRAVEL_WINDOW.endHour),
+}
+
+/** 旅行只读视图与手动派遣；TRAVEL_ENABLED 为 off 时保持 undefined，shim 据此返回 404。 */
+let travelApi: {
+  status: (region: WorkBuddyRegion) => unknown
+  depart: (region: WorkBuddyRegion, onlyId?: string) => Promise<{ results: Array<{ id: string; label: string; ok: boolean; message: string }> }>
+} | undefined
 
 /** 账号模式端口段：账号 i 使用 BASE + i（39320 起）。 */
 const ACCOUNT_PORT_BASE = Number(process.env['WORKBUDDY_ACCOUNT_PORT_BASE'] ?? 39320)
@@ -287,17 +300,54 @@ async function main(): Promise<void> {
   // ---- 账号库加载 + 与 live 去重 ----
   // 账号库是池化切换的唯一数据源。与 live 当前登录态重复的账号会被剔除，
   // 避免"换号换到自己"以及面板重复计余额。
+  //
+  // 关键：live 身份用 readLiveIdentity 读，**不要求 token 可解密**。
+  // 桌面端自 2026-09 起把 token 加密成 {$wbEncrypted, envelope}，
+  // parseWorkBuddyAuth 会失败；若因此认为"该区域没有 live 身份"，
+  // 就不会去重，池里会同时留着 live 和账号库两份同身份账号。
   const storedAll: StoredAccount[] = await accounts.load()
   const liveIds = new Map<WorkBuddyRegion, Set<string>>()
+  /** live 身份键（按 region）：去重与旅行目标去重都用它。 */
+  const liveIdentityKeys = new Map<WorkBuddyRegion, string[]>()
+  /** live 是否真的可用（能 resolve 出凭据）。不可用时用账号库同身份账号顶上。 */
+  const liveUsable = new Map<WorkBuddyRegion, boolean>()
   if ((process.env['WORKBUDDY_LIVE_MODE'] ?? 'on') !== 'off') {
     for (const region of (['cn', 'global'] as WorkBuddyRegion[])) {
+      const store = new LiveCredentialStore({ region, refresh: credential => client.refreshToken(credential) })
+      // 先试凭据（最权威）；失败则退到只读身份，至少还能拿到 uid 用于去重。
       try {
-        const store = new LiveCredentialStore({ region, refresh: credential => client.refreshToken(credential) })
         const credential = await store.resolve()
-        liveIds.set(region, new Set(identityKeysOfCredential(region, credential)))
+        const keys = identityKeysOfCredential(region, credential)
+        liveIdentityKeys.set(region, keys)
+        liveUsable.set(region, true)
       } catch {
-        // 未登录：该区域没有 live 身份，无需去重
+        liveUsable.set(region, false)
+        try {
+          const raw = await readFile(store.livePath(), 'utf8')
+          const identity = readLiveIdentity(raw)
+          if (identity !== undefined) {
+            const record = {
+              region,
+              uid: identity.uid,
+              domain: identity.domain,
+              uin: identity.uin,
+              label: 'live',
+              nickname: '',
+            }
+            liveIdentityKeys.set(region, identityKeysOfRecord(record))
+            logger.warn(
+              `workbuddy(${region}) live 登录态的 token 已加密（桌面端 2026-09 起改为 $wbEncrypted/envelope，`
+              + '本代理暂不能解密）。账号本身是登录正常的，将改用账号库中同身份（uid 相同）的账号顶上。'
+              + '副作用：以后**新增**账号无法捕获——捕获必须读 live 文件。'
+              + '根治需从 WorkBuddy.exe 取出构建期密钥（envelope 内明文 keyId 可自校验）。',
+            )
+          }
+        } catch {
+          // 连文件都读不到：真的没登录，该区域无 live 身份。
+        }
       }
+      const keys = liveIdentityKeys.get(region)
+      if (keys !== undefined && keys.length > 0) liveIds.set(region, new Set(keys))
     }
   }
   const stored = ACCOUNT_PORTS_ENABLED
@@ -308,7 +358,14 @@ async function main(): Promise<void> {
         storedAll,
       )
   const dropped = storedAll.length - stored.length
-  if (dropped > 0) logger.info(`账号库 ${storedAll.length} 个账号，其中 ${dropped} 个与 live 当前登录态重复，已从切换池剔除`)
+  if (dropped > 0) {
+    // live 不可用时，被去重的账号并没有被 live 顶替——必须回填，否则白丢一个可用账号。
+    const anyLiveDown = [...liveUsable.values()].some(v => v === false)
+    logger.info(
+      `账号库 ${storedAll.length} 个账号，其中 ${dropped} 个与 live 当前登录态重复，已从切换池剔除`
+      + (anyLiveDown ? '（live 不可用，同身份账号将自动回填）' : ''),
+    )
+  }
 
   // 账号库凭证存储：池化（默认）与调试端口模式共用同一批实例。
   const accountStores: Array<{ account: StoredAccount; region: WorkBuddyRegion; id: string; label: string; store: AccountCredentialStore }>
@@ -328,6 +385,45 @@ async function main(): Promise<void> {
       }
     })
 
+  // ---- 池内自动回填：live 不可用时，把被去重的同身份账号放回池里 ----
+  //
+  // 起因：去重的目的是「避免换号换到自己」，前提是 live 真的能用。
+  // 桌面端把 token 加密后 live 解析失败，但**身份字段仍是明文**，于是
+  // 「live = 账号库里那个 13800138002」这个事实依然成立——而那个账号在
+  // 账号库里存着可用的明文 token。若不回填，就等于为了一个用不了的 live
+  // 白白丢掉一个能用的账号。
+  const backfilledStores: typeof accountStores = []
+  if (!ACCOUNT_PORTS_ENABLED) {
+    for (const region of (['cn', 'global'] as WorkBuddyRegion[])) {
+      if (liveUsable.get(region) !== false) continue
+      const keys = liveIdentityKeys.get(region) ?? []
+      if (keys.length === 0) continue
+      const already = new Set(accountStores.map(a => a.id))
+      for (const account of storedAll) {
+        const accRegion = account.region ?? regionOfDomain(account.domain)
+        if (accRegion !== region) continue
+        if (identityKeysOfRecord(account).some(k => keys.includes(k))) {
+          const id = `acct:${account.key}`
+          if (already.has(id)) continue
+          already.add(id)
+          backfilledStores.push({
+            account,
+            region,
+            id,
+            label: `${region}·${account.nickname ?? account.uin ?? account.label}`,
+            store: new AccountCredentialStore({
+              accountKey: account.key,
+              region,
+              accounts,
+              refresh: credential => client.refreshToken(credential),
+            }),
+          })
+          logger.info(`workbuddy(${region}) live 不可用，已把同身份账号 ${account.nickname ?? account.uin ?? account.key} 回填进切换池`)
+        }
+      }
+    }
+  }
+
   // ---- 模式 1：跟随官方 live 登录态（端口 39301/39302），并承载该区域全部候选账号 ----
   const liveMode = (process.env['WORKBUDDY_LIVE_MODE'] ?? 'on') !== 'off'
   if (liveMode) {
@@ -344,10 +440,12 @@ async function main(): Promise<void> {
         catalog: new WorkBuddyCatalog(region),
         signin: new WorkBuddySigninService(store, client),
         scheduler: schedulerOf(region),
-        // 该地区账号库账号并入本端口的切换池
+        // 该地区账号库账号并入本端口的切换池（含 live 不可用时回填的同身份账号）
         pool: ACCOUNT_PORTS_ENABLED
           ? []
-          : accountStores.filter(a => a.region === region).map(a => ({ id: a.id, label: a.label, store: a.store })),
+          : [...accountStores, ...backfilledStores]
+            .filter(a => a.region === region)
+            .map(a => ({ id: a.id, label: a.label, store: a.store })),
       })
     }
   }
@@ -428,6 +526,15 @@ async function main(): Promise<void> {
         const outcome = await rt.scheduler.runNow(rt.id, () => rt.signin.claim())
         return { runtime: rt.id, label: rt.label, region: rt.region, ...outcome }
       } : undefined,
+      // 注意：这里只判断 TRAVEL_ENABLED，**不能**在创建时求值 travelApi ——
+      // 旅行块在本循环之后才运行，那时 travelApi 还是 undefined。
+      // 闭包在调用时才读它，因此能拿到已赋的值。
+      travelStatus: TRAVEL_ENABLED
+        ? () => ({ region: rt.region, ...(travelApi?.status(rt.region) as object) })
+        : undefined,
+      travelDepart: TRAVEL_ENABLED
+        ? async (onlyId?: string) => travelApi?.depart(rt.region, onlyId)
+        : undefined,
     })
     rt.shim = shim
     shims.push(shim)
@@ -480,152 +587,243 @@ async function main(): Promise<void> {
   }
 
   // ---- 派猫猫旅行（成长中心，仅国内版） ----
-  // 与签到的差别：旅行是两阶段状态机，需要记住 record_id / 到点时间，
-  // 故状态单独存 state/travel-state.json，由本进程按固定间隔轮询推进。
-  let travelTimer: NodeJS.Timeout | undefined
+  //
+  // 每账号一个**独立定时器**：派出后按「落地点 − server_now + 余量」睡到那一刻，
+  // 到点领取，领取后 60 秒重查再派，循环往复。A 号到点不会唤醒 B 号。
+  let travelTimers: Map<string, NodeJS.Timeout> = new Map()
+  let travelSweepTimer: NodeJS.Timeout | undefined
+  const travelInFlight = new Set<string>()
   if (TRAVEL_ENABLED) {
     await mkdir(STATE_DIR, { recursive: true, mode: 0o700 })
-    const travelTargets: Array<{ id: string; label: string; travel: WorkBuddyTravelService }> = []
-    for (const rt of runtimes) {
-      // 只有国内版有成长中心；国际版连请求都不发。
-      if (rt.accountKey === undefined && travelSupported(rt.region)) {
-        travelTargets.push({ id: rt.id, label: rt.label, travel: new WorkBuddyTravelService(rt.store, client) })
+
+    let travelStoreData: TravelStateStore = {}
+    try {
+      const raw = JSON.parse(await readFile(TRAVEL_STATE_FILE, 'utf8')) as unknown
+      if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+        travelStoreData = raw as TravelStateStore
       }
-    }
-    if (!ACCOUNT_PORTS_ENABLED) {
-      for (const a of accountStores) {
-        if (!travelSupported(a.region)) continue
-        travelTargets.push({
-          id: a.id,
-          label: a.label,
-          travel: new WorkBuddyTravelService(a.store, client),
-        })
-      }
+    } catch {
+      // 首次运行或文件损坏：从空状态开始，今天重来一次即可（幂等）。
     }
 
-    if (travelTargets.length > 0) {
-      let travelStoreData: TravelStateStore = {}
+    let travelDirty = false
+    let travelSaveTimer: NodeJS.Timeout | undefined
+    const saveTravelState = async (): Promise<void> => {
+      // 走 tmp + rename：崩溃或磁盘满时不会留下被截断的 JSON（与 AccountStore.save 同一做法）。
+      const tmp = `${TRAVEL_STATE_FILE}.tmp`
       try {
-        const raw = JSON.parse(await readFile(TRAVEL_STATE_FILE, 'utf8')) as unknown
-        if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
-          travelStoreData = raw as TravelStateStore
-        }
-      } catch {
-        // 首次运行或文件损坏：从空状态开始，今天重来一次即可（幂等）。
+        await writeFile(tmp, `${JSON.stringify(travelStoreData, null, 2)}\n`, { mode: 0o600 })
+        await rename(tmp, TRAVEL_STATE_FILE)
+      } catch (error) {
+        logger.warn('旅行状态写入失败：', error instanceof Error ? error.message : String(error))
+        await rm(tmp, { force: true }).catch(() => {})
       }
+    }
+    /** 标脏后合并写：多个账号各自唤醒也不会打多次盘。 */
+    const markTravelDirty = (): void => {
+      travelDirty = true
+      if (travelSaveTimer !== undefined) return
+      travelSaveTimer = setTimeout(() => {
+        travelSaveTimer = undefined
+        if (!travelDirty) return
+        travelDirty = false
+        saveTravelState().catch(() => {})
+      }, 2_000)
+      travelSaveTimer.unref()
+    }
 
-      const saveTravelState = async (): Promise<void> => {
-        // 走 tmp + rename：崩溃或磁盘满时不会留下被截断的 JSON
-        // （与 AccountStore.save 同一套做法）。真留下截断文件也不致命——
-        // 读回时 try/catch 会退回空状态，下轮重新读 status 由服务端 daily_limit 兜住。
-        const tmp = `${TRAVEL_STATE_FILE}.tmp`
-        try {
-          await writeFile(tmp, `${JSON.stringify(travelStoreData, null, 2)}\n`, { mode: 0o600 })
-          await rename(tmp, TRAVEL_STATE_FILE)
-        } catch (error) {
-          logger.warn('旅行状态写入失败：', error instanceof Error ? error.message : String(error))
-          await rm(tmp, { force: true }).catch(() => {})
-        }
-      }
+    // ---- 旅行目标集合：按身份去重 + 动态重建 ----
+    // live 与账号库可能存在同身份账号（桌面端登录的往往也在账号库里）。
+    // 两个目标同时对同一服务端账号派会互相消耗 daily_limit，故只留可用的那个。
+    const travelTargets = new Map<string, { id: string; label: string; region: WorkBuddyRegion; travel: WorkBuddyTravelService; keys: string[] }>()
 
-      // 每账号「下次需要查看」的绝对时刻；tick 返回 undefined 表示今日收工。
-      const nextWakeAt = new Map<string, number>()
+    const clearTravelTimers = (): void => {
+      for (const t of travelTimers.values()) clearTimeout(t)
+      travelTimers = new Map()
+    }
 
-      /**
-       * 跑一轮，然后按「最早需要被唤醒的时刻」重排定时器。
-       *
-       * 不做固定间隔轮询：一次 4 小时的行程只需醒来两次
-       * （出发时一次、到点领奖时一次），而不是每 10 分钟空转 24 次。
-       */
-      const travelTick = async (): Promise<void> => {
+    const scheduleOne = (id: string, atMs: number | undefined): void => {
+      const existing = travelTimers.get(id)
+      if (existing !== undefined) { clearTimeout(existing); travelTimers.delete(id) }
+      const now = Date.now()
+      const target = atMs === undefined ? now + MAX_TRAVEL_SLEEP_MS : atMs
+      // 下界 30 秒是洪泛兜底：正常唤醒点至少在 3 分钟后（CLAIM_GRACE_MS），
+      // 这个下界不会推迟任何正常唤醒，只挡时钟跳变等病态下的「每 1 秒醒一次」。
+      const delay = Math.min(Math.max(target - now, TRAVEL_MIN_WAKE_MS), MAX_TRAVEL_SLEEP_MS)
+      const handle = setTimeout(() => { void tickOne(id) }, delay)
+      handle.unref()
+      travelTimers.set(id, handle)
+    }
+
+    /** 推进单个账号，然后只重排它自己的定时器。 */
+    const tickOne = async (id: string): Promise<void> => {
+      const t = travelTargets.get(id)
+      if (t === undefined) return
+      if (travelInFlight.has(id)) return
+      travelInFlight.add(id)
+      try {
         const today = travelLocalDate()
-        const nowMs = Date.now()
-        let dirty = false
+        const entry = rollTravelStateToToday(travelStoreData[id] ?? createTravelState(today), today)
+        travelStoreData[id] = entry
+        const outcome = await t.travel.tick(entry)
+        markTravelDirty()
+        scheduleOne(id, outcome.nextWakeAtMs)
+        if (outcome.acted) logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}`)
+        else if (outcome.done) logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}`)
+        else if (outcome.nextWakeAtMs !== undefined && entry.result !== undefined) {
+          const mins = Math.max(1, Math.round((outcome.nextWakeAtMs - Date.now()) / 60000))
+          logger.info(`workbuddy(${t.label}) 旅行：${entry.result}，${mins} 分钟后再看`)
+        }
+      } catch (error) {
+        markTravelDirty()
+        const entry = travelStoreData[id]
+        if (entry !== undefined) {
+          entry.attemptedAtMs = Date.now()
+          entry.retryAfterMs = Date.now() + (TRAVEL_BACKOFF[0] as number)
+        }
+        scheduleOne(id, entry?.retryAfterMs)
+        logger.warn(`workbuddy(${t.label}) 旅行出错：`, error instanceof Error ? error.message : String(error))
+      } finally {
+        travelInFlight.delete(id)
+      }
+    }
 
-        for (const t of travelTargets) {
+    /**
+     * 重建旅行目标集合。
+     *
+     * `accounts.json` 变了（加号/删号）就重建，顺带剪掉状态里的孤儿条目；
+     * 没变则什么都不做。调用方保证只在 mtime 变化时进来。
+     */
+    const rebuildTravelTargets = async (): Promise<void> => {
+      const next = new Map<string, { id: string; label: string; region: WorkBuddyRegion; travel: WorkBuddyTravelService; keys: string[] }>()
+      const claimed = new Set<string>()
+
+      // 账号库账号（含 live 不可用时回填的同身份账号）。它们持有可用 token，优先于 live。
+      for (const a of [...accountStores, ...backfilledStores]) {
+        if (!travelSupported(a.region)) continue
+        const keys = identityKeysOfRecord(a.account)
+        if (keys.length === 0) continue
+        if (keys.some(k => claimed.has(k))) continue
+        keys.forEach(k => claimed.add(k))
+        next.set(a.id, { id: a.id, label: a.label, region: a.region, travel: new WorkBuddyTravelService(a.store, client, travelWindow), keys })
+      }
+
+      // live 运行时：仅当该身份尚未被账号库覆盖时才纳入（账号库那份优先，因为它有可用 token）。
+      for (const rt of runtimes) {
+        if (rt.accountKey !== undefined) continue
+        if (!travelSupported(rt.region)) continue
+        const keys = liveIdentityKeys.get(rt.region) ?? []
+        if (keys.length === 0) continue
+        if (keys.some(k => claimed.has(k))) continue
+        keys.forEach(k => claimed.add(k))
+        next.set(rt.id, { id: rt.id, label: rt.label, region: rt.region, travel: new WorkBuddyTravelService(rt.store, client, travelWindow), keys })
+      }
+
+      // 目标集合有变化才动定时器，避免无谓重排。
+      const sameIds = [...next.keys()].sort().join('|') === [...travelTargets.keys()].sort().join('|')
+      travelTargets.clear()
+      for (const [k, v] of next) travelTargets.set(k, v)
+
+      // 剪掉孤儿状态条目：账号已删，状态留着只会让文件单调增长。
+      let pruned = 0
+      for (const key of Object.keys(travelStoreData)) {
+        if (!travelTargets.has(key)) { delete travelStoreData[key]; pruned += 1 }
+      }
+      if (pruned > 0) { markTravelDirty(); logger.info(`旅行：清理 ${pruned} 个已删除账号的状态条目`) }
+
+      if (!sameIds) {
+        clearTravelTimers()
+        for (const id of travelTargets.keys()) scheduleOne(id, Date.now())
+        logger.info(`旅行目标已更新：${travelTargets.size} 个国内版账号${pruned > 0 ? `（清理 ${pruned} 条旧状态）` : ''}`)
+      }
+    }
+
+    await rebuildTravelTargets()
+
+    // 巡检：每 5 分钟只 stat accounts.json（本地磁盘操作、**零上游请求**），
+    // mtime 变了才重建目标集合——这样加账号最多 5 分钟内生效，又不会空转打上游。
+    let accountsSignature = await accounts.signature()
+    travelSweepTimer = setInterval(() => {
+      void (async () => {
+        try {
+          const sig = await accounts.signature()
+          if (sig === accountsSignature) return
+          accountsSignature = sig
+          await accounts.load()
+          await rebuildTravelTargets()
+        } catch (error) {
+          logger.warn('旅行：账号库巡检失败：', error instanceof Error ? error.message : String(error))
+        }
+      })()
+    }, TRAVEL_SWEEP_MS)
+    travelSweepTimer.unref()
+
+    logger.info(`派猫猫旅行已启用：每账号独立计时，派遣→领取→再派遣循环（${travelTargets.size} 个国内版账号）`)
+
+    // ---- 供 shim 使用的只读视图与手动派遣 ----
+    // 刻意按 region 过滤：travelTargets 是全局的，若不按端口区域筛，
+    // 国际版端口也会列出国内账号（实测踩过：两个端口返回同一份 cn 列表）。
+    travelApi = {
+      status: (region: WorkBuddyRegion) => {
+        const today = travelLocalDate()
+        const nowSec = Math.floor(Date.now() / 1000)
+        const accounts = []
+        for (const t of travelTargets.values()) {
+          if (t.region !== region) continue
           const entry = rollTravelStateToToday(travelStoreData[t.id] ?? createTravelState(today), today)
-          travelStoreData[t.id] = entry
-
-          // 今日已完成：整轮跳过，不向上游发任何请求。
-          if (entry.done) { nextWakeAt.delete(t.id); continue }
-          // 失败冷却中：跳过，避免抖动时持续打上游。
-          // 必须把冷却截止时刻登记为唤醒点：否则本账号在 nextWakeAt 里缺席，
-          // 一旦所有账号都处于冷却，定时器会退化成 6 小时兜底，
-          // 把一个「2 分钟后就能重试」的任务睡过头。
-          if (entry.retryAfterMs !== undefined && nowMs < entry.retryAfterMs) {
-            nextWakeAt.set(t.id, entry.retryAfterMs)
+          accounts.push({
+            id: t.id,
+            label: t.label,
+            region: t.region,
+            state: entry.state,
+            locationName: entry.locationName ?? '',
+            durationHours: entry.durationHours ?? 0,
+            // 同时给出 arriveAt 与 serverNow：前端算一次差值后本地倒计时，不必每次问后端。
+            arriveAt: entry.arriveAt,
+            serverNow: nowSec,
+            rewardCredit: entry.rewardCredit ?? 0,
+            claimedCredit: entry.claimedCredit ?? 0,
+            claimedAtMs: entry.claimedAtMs ?? 0,
+            done: entry.done,
+            doneReason: entry.doneReason ?? null,
+            result: entry.result ?? '',
+          })
+        }
+        return { accounts, window: travelWindow, nowMs: Date.now() }
+      },
+      depart: async (region: WorkBuddyRegion, onlyId?: string) => {
+        const targets = [...travelTargets.values()]
+          .filter(t => t.region === region)
+          .filter(t => onlyId === undefined || t.id === onlyId)
+        if (targets.length === 0) return { results: [] as Array<{ id: string; label: string; ok: boolean; message: string }> }
+        const results: Array<{ id: string; label: string; ok: boolean; message: string }> = []
+        for (const [i, t] of targets.entries()) {
+          // 账号间错开 2 秒，避免集中打上游触发 QPS 限流。
+          if (i > 0) await new Promise(r => setTimeout(r, TRAVEL_DEPART_STAGGER_MS))
+          if (travelInFlight.has(t.id)) {
+            results.push({ id: t.id, label: t.label, ok: false, message: '该账号正在处理中，请稍候' })
             continue
           }
-
+          travelInFlight.add(t.id)
           try {
-            const outcome = await t.travel.tick(entry)
-            dirty = true
-            if (outcome.nextWakeAtMs === undefined) nextWakeAt.delete(t.id)
-            else nextWakeAt.set(t.id, outcome.nextWakeAtMs)
-            if (outcome.acted) logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}`)
-            else if (outcome.done) logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}`)
-            else if (outcome.nextWakeAtMs !== undefined) {
-              // 只在「本轮不写上游」时补一条：说明从现在起它会安安静静地睡到到点。
-              const mins = Math.max(1, Math.round((outcome.nextWakeAtMs - Date.now()) / 60000))
-              logger.info(`workbuddy(${t.label}) 旅行：${outcome.message}，${mins} 分钟后再看`)
-            }
+            const today = travelLocalDate()
+            const entry = rollTravelStateToToday(travelStoreData[t.id] ?? createTravelState(today), today)
+            travelStoreData[t.id] = entry
+            const out = await t.travel.departNow(entry)
+            markTravelDirty()
+            scheduleOne(t.id, Date.now() + MAX_TRAVEL_SLEEP_MS)
+            results.push({ id: t.id, label: t.label, ok: out.ok, message: out.message })
+            logger.info(`workbuddy(${t.label}) 手动派遣：${out.message}`)
           } catch (error) {
-            dirty = true
-            entry.attemptedAtMs = Date.now()
-            entry.retryAfterMs = Date.now() + TRAVEL_RETRY_COOLDOWN_MS
-            nextWakeAt.set(t.id, entry.retryAfterMs)
-            const message = `旅行出错：${error instanceof Error ? error.message : String(error)}`
-            entry.result = message
-            logger.warn(`workbuddy(${t.label}) ${message}`)
+            const message = error instanceof Error ? error.message : String(error)
+            results.push({ id: t.id, label: t.label, ok: false, message: `派遣失败：${message}` })
+            logger.warn(`workbuddy(${t.label}) 手动派遣失败：`, message)
+          } finally {
+            travelInFlight.delete(t.id)
           }
         }
-
-        if (dirty) await saveTravelState()
-        scheduleNextWake()
-      }
-
-      /**
-       * 触发一轮旅行推进。
-       *
-       * 刻意吞掉异常：`void promise` 一旦产生未捕获的 rejection，Node 24 的
-       * 默认行为是**直接终止进程**——而这个进程正承载着编辑器用的模型端点，
-       * 绝不能因为一次旅行的小故障就整体退出。catch 里再补一次重排，
-       * 保证即便某一轮炸了，后续仍会继续推进。
-       */
-      const runTravelTick = (): void => {
-        travelTick().catch((error: unknown) => {
-          logger.warn(
-            '旅行调度异常（已忽略，不影响服务）：',
-            error instanceof Error ? error.message : String(error),
-          )
-          try { scheduleNextWake() } catch { /* 连重排都失败就不再挣扎 */ }
-        })
-      }
-
-      /** 按所有账号里最早的那个时刻重排定时器。 */
-      const scheduleNextWake = (): void => {
-        if (travelTimer !== undefined) { clearTimeout(travelTimer); travelTimer = undefined }
-        let earliest: number | undefined
-        for (const at of nextWakeAt.values()) {
-          if (earliest === undefined || at < earliest) earliest = at
-        }
-        const now = Date.now()
-        // 全部收工：睡满一整段再整体看一眼（跨天重置由 rollTravelStateToToday 兜住）。
-        // 下界 30 秒是洪泛兜底：正常唤醒点至少在 3 分钟后（见 CLAIM_GRACE_MS），
-        // 这个下界不会推迟任何一次正常唤醒，只用于挡住时钟跳变等病态情况下的
-        // 「每 1 秒醒一次」——那会在每轮里对每个未完成账号各打一次上游。
-        const delay = earliest === undefined
-          ? TRAVEL_IDLE_POLL_MS
-          : Math.min(Math.max(earliest - now, TRAVEL_MIN_WAKE_MS), MAX_TRAVEL_SLEEP_MS)
-        travelTimer = setTimeout(() => { runTravelTick() }, delay)
-        travelTimer.unref()
-        logger.info(`旅行下次检查：${new Date(now + delay).toLocaleString('zh-CN')}（${Math.round(delay / 60000)} 分钟后）`)
-      }
-
-      // 延迟一小会儿再跑首轮：避免在启动过程中抢上游，同时抓住
-      // 「昨天派出、今天已到点可领」的情况（与签到的初始延迟同一思路）。
-      setTimeout(() => { runTravelTick() }, TRAVEL_INITIAL_DELAY_MS).unref()
-      logger.info(`派猫猫旅行已启用：按到点时刻精确唤醒，不做固定轮询（${travelTargets.length} 个国内版账号）`)
+        return { results }
+      },
     }
   }
 
@@ -653,7 +851,9 @@ async function main(): Promise<void> {
     logger.info(`收到 ${signal}，正在关闭...`)
     clearInterval(timer)
     if (signinTimer !== undefined) clearInterval(signinTimer)
-    if (travelTimer !== undefined) clearTimeout(travelTimer)
+    for (const t of travelTimers.values()) clearTimeout(t)
+    travelTimers = new Map()
+    if (travelSweepTimer !== undefined) clearInterval(travelSweepTimer)
     await Promise.allSettled(shims.map(shim => shim.close()))
     process.exit(0)
   }
