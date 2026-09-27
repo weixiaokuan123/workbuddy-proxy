@@ -97,7 +97,7 @@ export interface TravelState {
   /** 今日收工：今日已派完 / 窗外 / 确认无 Buddy。跨天重置 */
   done: boolean
   /** 收工原因，供面板区分「今日已派」与「无 Buddy」 */
-  doneReason?: 'daily-limit' | 'no-buddy' | 'window' | 'claimed'
+  doneReason?: 'daily-limit' | 'no-buddy' | 'window' | 'claimed' | 'paused'
   /** 面板展示用的一句话结果 */
   result?: string
   /** 最近一次领取成功的时刻（ms），用于「刚领到 +N 积分」的展示窗口 */
@@ -265,6 +265,24 @@ export class WorkBuddyTravelService {
    * 仍能按服务端时区算出「下一次可派时刻」，而不是退回本机时钟。
    */
   private lastServerNow = 0
+  /**
+   * 是否允许**发起新派遣**。
+   *
+   * 语义（用户明确要求）：关掉后**不再派新的**，但**已经在路上的照常领取**——
+   * 否则手动关一下就把已赚的积分丢了，且服务端每天一次的额度可能作废。
+   * 所以这个开关只在「准备 depart」那一处生效，claim 路径完全不看它。
+   */
+  private dispatchEnabled = true
+
+  /** 运行时开关（由 hub 的开关调用）。返回切换后的状态。 */
+  setDispatchEnabled(on: boolean): boolean {
+    this.dispatchEnabled = on
+    return this.dispatchEnabled
+  }
+
+  isDispatchEnabled(): boolean {
+    return this.dispatchEnabled
+  }
 
   constructor(store: TravelCredentialStore, client: WorkBuddyUpstreamClient, window: TravelWindow = DEFAULT_TRAVEL_WINDOW) {
     this.store = store
@@ -340,6 +358,10 @@ export class WorkBuddyTravelService {
     }
     if (!withinWindow(status.serverNow, this.window)) {
       return this.rest(entry, '不在可派时段', 'window', nowMs, status.serverNow)
+    }
+    // 开关只挡「派新的」；上面 claim 分支已经跑完了，在途的不受影响。
+    if (!this.dispatchEnabled) {
+      return this.rest(entry, '派遣已暂停（仍在途的行程照常领取）', 'paused', nowMs, status.serverNow)
     }
     return await this.depart(entry, nowMs)
   }

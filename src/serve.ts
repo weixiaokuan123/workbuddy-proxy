@@ -41,6 +41,7 @@ const KEYS_DIR = join(ROOT, 'keys')
 const STATE_DIR = join(ROOT, 'state')
 const ACCOUNTS_FILE = join(STATE_DIR, 'accounts.json')
 const TRAVEL_STATE_FILE = join(STATE_DIR, 'travel-state.json')
+const TRAVEL_CONFIG_FILE = join(STATE_DIR, 'travel-config.json')
 
 const SIGNIN_ENABLED = (process.env['WORKBUDDY_SIGNIN'] ?? 'on') !== 'off'
 const SIGNIN_START_HOUR = Number(process.env['WORKBUDDY_SIGNIN_START_HOUR'] ?? 7)
@@ -67,6 +68,7 @@ const travelWindow: TravelWindow = {
 /** 旅行只读视图与手动派遣；TRAVEL_ENABLED 为 off 时保持 undefined，shim 据此返回 404。 */
 let travelApi: {
   status: (region: WorkBuddyRegion) => unknown
+  setDispatch: (on: boolean) => Promise<{ dispatchEnabled: boolean }>
   depart: (region: WorkBuddyRegion, onlyId?: string) => Promise<{ results: Array<{ id: string; label: string; ok: boolean; message: string }> }>
 } | undefined
 
@@ -594,6 +596,9 @@ async function main(): Promise<void> {
       travelDepart: TRAVEL_ENABLED
         ? async (onlyId?: string) => travelApi?.depart(rt.region, onlyId)
         : undefined,
+      travelSetDispatch: TRAVEL_ENABLED
+        ? async (on: boolean) => travelApi?.setDispatch(on)
+        : undefined,
     })
     rt.shim = shim
     shims.push(shim)
@@ -659,6 +664,28 @@ async function main(): Promise<void> {
   const travelInFlight = new Set<string>()
   if (TRAVEL_ENABLED) {
     await mkdir(STATE_DIR, { recursive: true, mode: 0o700 })
+
+    // 派遣开关（运行时可切，状态落盘以便重启后保持）。
+    // WORKBUDDY_TRAVEL=off 是环境变量层面的总闸，仍然优先——那是运维手段。
+    let dispatchEnabled = true
+    try {
+      const raw = JSON.parse(await readFile(TRAVEL_CONFIG_FILE, 'utf8')) as { dispatchEnabled?: unknown }
+      if (typeof raw.dispatchEnabled === 'boolean') dispatchEnabled = raw.dispatchEnabled
+    } catch {
+      // 首次运行或文件损坏：用默认开启
+    }
+    const applyDispatch = (on: boolean): void => {
+      dispatchEnabled = on
+      for (const t of travelTargets.values()) t.travel.setDispatchEnabled(on)
+      logger.info(`旅行派遣已${on ? '开启' : '暂停（在途行程仍会照常领取）'}`)
+    }
+    const saveDispatchConfig = async (): Promise<void> => {
+      try {
+        await writeFile(TRAVEL_CONFIG_FILE, JSON.stringify({ dispatchEnabled }, null, 2) + '\n', { mode: 0o600 })
+      } catch (error) {
+        logger.warn('旅行开关写入失败：', error instanceof Error ? error.message : String(error))
+      }
+    }
 
     let travelStoreData: TravelStateStore = {}
     try {
@@ -803,6 +830,8 @@ async function main(): Promise<void> {
     }
 
     await rebuildTravelTargets()
+    // 把落盘的开关状态套到刚建好的每个 service 上（新建的默认 true）
+    applyDispatch(dispatchEnabled)
 
     // 巡检：每 5 分钟只 stat accounts.json（本地磁盘操作、**零上游请求**），
     // mtime 变了才重建目标集合——这样加账号最多 5 分钟内生效，又不会空转打上游。
@@ -853,7 +882,22 @@ async function main(): Promise<void> {
             result: entry.result ?? '',
           })
         }
-        return { accounts, window: travelWindow, nowMs: Date.now() }
+        return { accounts, window: travelWindow, nowMs: Date.now(), dispatchEnabled }
+      },
+      /**
+       * 切换「是否派新的行程」。
+       *
+       * 关掉后不再 depart，但**已经在途的仍会到点自动领取**——手动关一下不该
+       * 把已赚的积分丢掉。开启时把每个账号的定时器立刻重排到最近（30 秒），
+       * 否则它们还睡在「下次 08:05」，要等到明早才会派。
+       */
+      setDispatch: async (on: boolean) => {
+        applyDispatch(on)
+        await saveDispatchConfig()
+        if (on) {
+          for (const id of travelTargets.keys()) scheduleOne(id, Date.now() + 30_000)
+        }
+        return { dispatchEnabled }
       },
       depart: async (region: WorkBuddyRegion, onlyId?: string) => {
         const targets = [...travelTargets.values()]

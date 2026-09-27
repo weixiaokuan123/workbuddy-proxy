@@ -156,6 +156,11 @@ export interface WorkBuddyShimOptions {
    */
   travelDepart?: (onlyId?: string) => Promise<unknown>
   /**
+   * 开关「是否派新行程」。关掉后不再 depart，但在途的仍会到点自动领取。
+   * 不提供则 /travel/enable 返回 404。
+   */
+  travelSetDispatch?: (on: boolean) => Promise<unknown>
+  /**
    * 限流切换：返回**同区域**的全部候选（含本端口自身），由 shim 决定尝试顺序。
    * 不提供则退化为单账号行为（遇限流直接报错）。
    */
@@ -355,6 +360,22 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       if (url.split('?')[0] === '/travel/status' && req.method === 'GET') {
         if (!options.travelStatus) { writeOpenAIError(res, 404, 'not_found', '旅行功能不可用'); return }
         try { writeJson(res, 200, options.travelStatus()); return }
+        catch (error) { writeOpenAIError(res, 502, 'travel_error', error instanceof Error ? error.message : String(error)); return }
+      }
+      if (url.split('?')[0] === '/travel/enable' && req.method === 'POST') {
+        if (!options.travelSetDispatch) { writeOpenAIError(res, 404, 'not_found', '旅行功能不可用'); return }
+        let on = true
+        try {
+          const raw = (await readBody(req)).toString('utf8')
+          if (raw.trim() !== '') {
+            const parsed = JSON.parse(raw) as { enabled?: unknown }
+            // 只接受布尔值；缺省视为「开启」，不猜。
+            if (typeof parsed.enabled === 'boolean') on = parsed.enabled
+          }
+        } catch {
+          // body 解析失败：按「开启」处理
+        }
+        try { writeJson(res, 200, await options.travelSetDispatch(on)); return }
         catch (error) { writeOpenAIError(res, 502, 'travel_error', error instanceof Error ? error.message : String(error)); return }
       }
       if (url.split('?')[0] === '/travel/depart' && req.method === 'POST') {

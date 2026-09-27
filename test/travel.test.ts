@@ -377,6 +377,68 @@ test('同一天调用 rollTravelStateToToday 返回原对象', () => {
   assert.equal(rollTravelStateToToday(entry, TODAY), entry)
 })
 
+// ---------- 派遣开关：停新派遣，在途仍领 ----------
+
+test('开关关闭 → 不派新的，标记为已暂停', async () => {
+  const rec = fresh()
+  const svc = makeService({ status: statusOf({ state: 'idle', dailyLimitReached: false }), recorder: rec })
+  svc.setDispatchEnabled(false)
+  const entry = createTravelState(TODAY)
+  const out = await svc.tick(entry)
+
+  assert.equal(rec.departs.length, 0, '关闭时不应 depart')
+  assert.equal(out.done, true)
+  assert.equal(entry.doneReason, 'paused')
+  assert.equal(svc.isDispatchEnabled(), false)
+})
+
+test('开关关闭 → 在途行程照常领取（关键语义）', async () => {
+  const rec = fresh()
+  const svc = makeService({
+    status: statusOf({ state: 'arrived', recordId: 42, locationName: '咖啡馆', rewardCredit: 6 }),
+    recorder: rec,
+  })
+  svc.setDispatchEnabled(false)
+  const entry = createTravelState(TODAY)
+  const out = await svc.tick(entry)
+
+  assert.equal(rec.claims.length, 1, '关闭开关也必须能领在途的奖励')
+  // mock 的 claimTravel 默认返回 7，且 claim 结果优先于 status 里的 6
+  assert.equal(entry.claimedCredit, 7)
+  assert.equal(out.done, true)
+  assert.equal(entry.doneReason, 'claimed')
+})
+
+test('开关关闭 → 在途未到点也不打扰，纯等落地点', async () => {
+  const rec = fresh()
+  const svc = makeService({
+    status: statusOf({ state: 'traveling', recordId: 7, arriveAt: 5000, serverNow: 1000, dailyLimitReached: true, locationName: '健身房' }),
+    recorder: rec,
+  })
+  svc.setDispatchEnabled(false)
+  const entry = createTravelState(TODAY)
+  const out = await svc.tick(entry)
+
+  assert.equal(rec.departs.length, 0)
+  assert.equal(rec.claims.length, 0)
+  assert.equal(out.done, false, '在途未到点，仍等落地点')
+  assert.ok((out.nextWakeAtMs as number) > Date.now())
+})
+
+test('开关重新打开 → 恢复派遣能力', async () => {
+  const rec = fresh()
+  const svc = makeService({ status: statusOf({ state: 'idle', dailyLimitReached: false }), recorder: rec })
+  svc.setDispatchEnabled(false)
+  await svc.tick(createTravelState(TODAY))
+  assert.equal(rec.departs.length, 0)
+
+  svc.setDispatchEnabled(true)
+  const entry = createTravelState(TODAY)
+  await svc.tick(entry)
+  assert.equal(rec.departs.length, 1, '重新打开后应能派遣')
+  assert.equal(svc.isDispatchEnabled(), true)
+})
+
 // ---------- 手动派遣 ----------
 
 test('departNow：未达上限且空闲 → 派出', async () => {
