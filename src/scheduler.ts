@@ -187,15 +187,24 @@ export class SigninScheduler {
       // 失败时更新内存中的结果，但**不无条件写盘**：
       // 某区域长期不可用（如从未登录）时，每个 tick 都落盘会造成无意义的硬盘写入。
       // 仅当「距上次写盘超过 FAIL_WRITE_BACKOFF_MS」时才持久化一次，限制写盘频率。
-      entry.result = `失败：${String(error instanceof Error ? error.message : error)}`
+      const message = String(error instanceof Error ? error.message : error)
+      entry.result = `失败：${message}`
       entry.attemptedAtMs = Date.now()
+      // 失败也必须进入冷却，否则 runIfDue 的 retryAfterMs 门禁永远拦不住它：
+      // 像 live-cn 这种「token 已被桌面端加密」的**永久性**失败会每 5 分钟重试一次，
+      // 每天 288 次无谓的上游请求 + 288 条日志（两个 live 目标就是 576 次/天）。
+      // 跨天由 ensureEntry 重建 entry（不带 retryAfterMs），所以冷却不会卡到第二天。
+      entry.retryAfterMs = entry.attemptedAtMs + RETRY_COOLDOWN_MS
       const last = this.lastFailWriteMs[target] ?? 0
       const backoff = this.options.failWriteBackoffMs ?? FAIL_WRITE_BACKOFF_MS
-      if (Date.now() - last >= backoff) {
+      const cooled = Date.now() - last < backoff
+      if (!cooled) {
         await this.save().catch(() => {})
         this.lastFailWriteMs[target] = Date.now()
       }
-      this.options.log?.(`签到[${target}] 失败：${String(error instanceof Error ? error.message : error)}`)
+      // 日志与写盘共用同一个节流窗口：否则冷却期内的重试虽被门禁挡住，
+      // 但一旦有人手动触发仍会刷屏。
+      if (!cooled) this.options.log?.(`签到[${target}] 失败：${message}`)
       return { ran: true, entry }
     } finally {
       this.inflight.delete(target)

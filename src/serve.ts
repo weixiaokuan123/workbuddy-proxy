@@ -33,7 +33,7 @@ import {
   type TravelStateStore,
 } from './travel.ts'
 
-import { redactPaths } from './redact.ts'
+import { redact, redactPaths } from './redact.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -119,7 +119,10 @@ function ts(): string {
  * 日志参数格式化。
  *
  * - 对象不再被 String() 压成 "[object Object]"，改为 JSON，保住诊断信息；
- * - 统一做路径脱敏：日志会追加落盘长期保存，不应写入本机用户名与目录结构。
+ * - 统一做路径脱敏：日志会追加落盘长期保存，不应写入本机用户名与目录结构；
+ * - 统一做身份打码：账号 label 就是手机号/邮箱，而签到、旅行、切换池这些日志
+ *   几乎每条都带 label（实测单个日志文件里有 1200+ 个手机号）。日志会被贴到
+ *   issue 里求助，也会长期留在磁盘上，必须在写入前打码。
  */
 function fmtLogArgs(args: unknown[]): string {
   const text = args.map((a) => {
@@ -127,7 +130,7 @@ function fmtLogArgs(args: unknown[]): string {
     if (a instanceof Error) return `${a.name}: ${a.message}`
     try { return JSON.stringify(a) ?? String(a) } catch { return String(a) }
   }).join(' ')
-  return redactPaths(text)
+  return redact(text)
 }
 
 /**
@@ -215,6 +218,26 @@ let suppressedLogCount = 0
  * 「同类日志已抑制 N 条」就永远刷不出来，事后也看不出到底发生过多少次。
  * 现在窗口到期会先落盘计数、再让当前这条正常输出，保证每个窗口至少留一行可见。
  */
+/**
+ * 从日志文本推导去重 key：**归一化其中的易变部分**。
+ *
+ * 之前 key 直接用完整文本，于是「同一条事件」只要带了变化的数字就被当成新事件，
+ * 去重形同虚设。实测最吵的两条：
+ *   - 「触发频率限制，37s 后恢复」——每次秒数都不同
+ *   - 「完成本次请求（第 2/5 个）」——每次序号都不同
+ * 活跃编码时这两条合计约 900 次同步写/小时。
+ *
+ * 只归一化「同一次事件里必然变」的那几处，**不**把所有数字都替换掉：
+ * 端口（39301/39302）、账号名、模型数是有意义的区分，压掉它们会把不同区域
+ * 的日志合并成一条，比刷屏更难查。
+ */
+function logDedupKey(level: string, text: string): string {
+  return `${level}:${text
+    .replace(/(\d+)\s*s 后恢复/g, 'Ns 后恢复')
+    .replace(/第\s*\d+\/\d+\s*个/g, '第 #/# 个')
+    .replace(/第\s*\d+\s*个/g, '第 # 个')}`
+}
+
 function shouldSuppressLog(key: string): { suppress: boolean; flushNote: string | null } {
   const now = Date.now()
   const sameKey = key === lastLogKey
@@ -238,7 +261,7 @@ function shouldSuppressLog(key: string): { suppress: boolean; flushNote: string 
 
 function emitLog(level: 'info' | 'warn' | 'error', args: unknown[]): void {
   const text = fmtLogArgs(args)
-  const { suppress, flushNote } = shouldSuppressLog(`${level}:${text}`)
+  const { suppress, flushNote } = shouldSuppressLog(logDedupKey(level, text))
   const at = ts()
   if (flushNote !== null) writeLog(level, `[${at}] [${level}] ${flushNote}\n`)
   if (suppress) return

@@ -22,7 +22,7 @@ import type { WorkBuddyCatalog } from './catalog.ts'
 import { parseRateLimitResetMs, prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
 import { CreditCache } from './credit-cache.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
-import { redactPaths } from './redact.ts'
+import { redact, redactPaths } from './redact.ts'
 
 /** shim 只要求这两个方法，LiveCredentialStore 与 AccountCredentialStore 都满足。 */
 export interface CredentialStoreLike {
@@ -223,8 +223,8 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function writeOpenAIError(res: ServerResponse, status: number, kind: string, message: string): void {
-  // 统一脱敏本机路径，避免日志/界面泄露真实用户名与目录。
-  writeJson(res, status, { error: { message: redactPaths(message), type: kind, code: kind } })
+  // 统一脱敏本机路径与账号身份（手机号/邮箱），避免日志/界面泄露真实用户名与账号。
+  writeJson(res, status, { error: { message: redact(message), type: kind, code: kind } })
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {

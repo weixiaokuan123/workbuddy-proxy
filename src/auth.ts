@@ -333,7 +333,7 @@ export class LiveCredentialStore {
         )
       }
       throw new Error(
-        `workbuddy(${this.region}): 未找到登录态文件 ${path}；`
+        `workbuddy(${this.region}): 未找到登录态文件 ${redactPaths(path)}；`
         + `请先在对应区域的 WorkBuddy 桌面端登录，或用 ${AUTH_FILE_ENV[this.region]} 指定文件路径`,
       )
     }
