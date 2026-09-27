@@ -313,20 +313,34 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         return
       }
       if (req.method === 'GET' && (url === '/credits' || url === '/credits/')) {
-        try {
-          const credential = await store.resolve()
-          const result = await creditCache.get(credential, c => options.client.fetchCredits(c))
-          writeJson(res, 200, {
-            region,
-            ...result.credits,
-            // 面板据此判断数据是否为缓存/降级值，便于显示「缓存于 N 秒前」。
-            cache: { cached: result.cached, stale: result.stale, ageSec: Math.round(result.ageMs / 1000) },
-          })
-          return
-        } catch (error) {
-          writeOpenAIError(res, 502, 'credits_error', error instanceof Error ? error.message : String(error))
-          return
+        // 依次尝试：本端口账号 → 同区池内其它账号。
+        // 起因：桌面端把 live token 加密后，本端口的 live 凭据解不出来，
+        // /credits 会直接 502——但同区账号库里往往有可用的同身份账号。
+        // 面板的积分区读的是 /status 的 pool.entries，不受影响；这里是让
+        // 这个端点本身也别因为某个账号不可用就整体罢工。
+        const candidates: readonly CredentialStoreLike[] = options.failover === undefined
+          ? [store]
+          : [store, ...options.failover.candidates().filter(c => c.id !== options.failover?.selfId).map(c => c.store)]
+        let lastError = '无可用账号'
+        for (const [index, candidate] of candidates.entries()) {
+          try {
+            const credential = await candidate.resolve()
+            const result = await creditCache.get(credential, c => options.client.fetchCredits(c))
+            writeJson(res, 200, {
+              region,
+              ...result.credits,
+              // 面板据此判断数据是否为缓存/降级值，便于显示「缓存于 N 秒前」。
+              cache: { cached: result.cached, stale: result.stale, ageSec: Math.round(result.ageMs / 1000) },
+              // 非首选账号时明确标出，避免把某个号的余额误当成本端口的。
+              ...(index === 0 ? {} : { fallbackAccount: true }),
+            })
+            return
+          } catch (error) {
+            lastError = error instanceof Error ? error.message : String(error)
+          }
         }
+        writeOpenAIError(res, 502, 'credits_error', lastError)
+        return
       }
       if (url.split('?')[0] === '/signin/status' && req.method === 'GET') {
         if (!options.signinStatus) { writeOpenAIError(res, 404, 'not_found', '签到功能不可用'); return }

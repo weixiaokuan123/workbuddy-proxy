@@ -549,14 +549,20 @@ async function main(): Promise<void> {
   // 每日签到：到当天随机时刻自动领取（每个账号独立随机）
   // 注意：池化模式下账号库账号不是独立 runtime，须单列出来一起签到，
   // 否则它们会永远收不到每日积分。
+  // **必须包含 backfilledStores**：live 不可用时被去重、又因回填而重新可用的
+  // 账号，同样要拿到每日签到积分，否则回填只恢复了对话与旅行，签到却漏了。
   const signinTargets: Array<{ id: string; label: string; signin: WorkBuddySigninService; scheduler: SigninScheduler }> = []
+  const signinSeen = new Set<string>()
   for (const rt of runtimes) {
-    if (rt.accountKey === undefined) {
+    if (rt.accountKey === undefined && !signinSeen.has(rt.id)) {
+      signinSeen.add(rt.id)
       signinTargets.push({ id: rt.id, label: rt.label, signin: rt.signin, scheduler: rt.scheduler })
     }
   }
   if (!ACCOUNT_PORTS_ENABLED) {
-    for (const a of accountStores) {
+    for (const a of [...accountStores, ...backfilledStores]) {
+      if (signinSeen.has(a.id)) continue
+      signinSeen.add(a.id)
       signinTargets.push({
         id: a.id,
         label: a.label,
