@@ -16,6 +16,7 @@ import {
   rollTravelStateToToday,
   withinWindow,
   msUntilWindowOpens,
+  nextWindowOpenMs,
   backoffMs,
   CLAIM_GRACE_MS,
   REDISPATCH_DELAY_MS,
@@ -114,7 +115,7 @@ test('领取成功后收工到次日（每日上限不因领取而重置）', as
   // claim 返回的 rewardCredit 优先于 status 里的（mock 默认返回 7）
   assert.equal(entry.claimedCredit, 7, '奖励已记账')
   const gap = (t1.nextWakeAtMs as number) - Date.now()
-  assert.ok(gap > 3600_000, `应睡到次日，实际仅 ${Math.round(gap / 60000)} 分钟`)
+  assert.ok(gap > 3600_000, `应睡到下次可派时刻，实际仅 ${Math.round(gap / 60000)} 分钟`)
 })
 
 test('已达每日上限且空闲 → 睡到次日，不再尝试派遣', async () => {
@@ -125,7 +126,7 @@ test('已达每日上限且空闲 → 睡到次日，不再尝试派遣', async 
   assert.equal(rec.departs.length, 0, '已达上限时不应再发 depart')
   assert.equal(out.done, true)
   assert.equal(entry.doneReason, 'daily-limit')
-  assert.ok((out.nextWakeAtMs as number) - Date.now() > 3600_000, '应睡到次日')
+  assert.ok((out.nextWakeAtMs as number) - Date.now() >= 60_000, '应睡到下次可派时刻')
 })
 
 test('idle + 已达每日上限 → 不派，今日收工', async () => {
@@ -278,6 +279,31 @@ test('msUntilWindowOpens：窗内为 0，窗外给出正数', () => {
   assert.equal(msUntilWindowOpens(at(10), w, 0), 0)
   const wait = msUntilWindowOpens(at(23), w, Date.now())
   assert.ok(wait > 0 && wait <= 24 * 3600 * 1000, `应给出合理等待，实际 ${wait}`)
+})
+
+test('nextWindowOpenMs：收工后睡到下次开窗，绝不睡到 00:05', () => {
+  // 这是个真实踩过的坑：窗口是 8–23，若收工时统一睡「次日 00:05」，
+  // 就会「00:05 醒 → 窗口关 → 再睡 24 小时」无限循环，功能静默停摆。
+  const w: TravelWindow = { startHour: 8, endHour: 23 }
+  const now = Date.now()
+  const at = (h: number, mi = 0) => Math.floor(new Date(2026, 8, 27, h, mi, 0).getTime() / 1000)
+
+  // 凌晨：应睡到「当天」08:05，而不是次日 00:05
+  const fromMidnight = nextWindowOpenMs(at(0, 5), w, now) - now
+  assert.ok(fromMidnight > 7 * 3600_000 && fromMidnight < 9 * 3600_000,
+    `00:05 应睡到当天 08:05（约 8 小时），实际 ${Math.round(fromMidnight / 3600_000)} 小时`)
+
+  // 窗口内但因 daily_limit 收工：必须睡到**明天**开窗，绝不能返回 0（否则忙循环）
+  const fromNoon = nextWindowOpenMs(at(12), w, now) - now
+  assert.ok(fromNoon > 19 * 3600_000, `12:00 收工应睡到明日 08:05，实际 ${Math.round(fromNoon / 3600_000)} 小时`)
+
+  // 不变式：任何时刻都必须至少睡 1 分钟，杜绝忙循环
+  for (let h = 0; h < 24; h++) {
+    for (const mi of [0, 5, 30, 59]) {
+      const w2 = nextWindowOpenMs(at(h, mi), w, now) - now
+      assert.ok(w2 >= 60_000, `${h}:${mi} 只睡了 ${Math.round(w2 / 1000)} 秒，有忙循环风险`)
+    }
+  }
 })
 
 // ---------- 失败处理 ----------

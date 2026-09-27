@@ -206,6 +206,31 @@ export function msUntilWindowOpens(serverNowSec: number, window: TravelWindow, n
   return Math.max(60_000, deltaSec * 1000)
 }
 
+/**
+ * 下一次可派时刻的**绝对**时刻（本地 ms）。
+ *
+ * 两个要点：
+ *
+ * 1. **不能**复用 {@link msUntilWindowOpens}。那个函数在「已在窗内」时返回 0，
+ *    而这里要的语义是「今天不能派了，睡到下次开窗」——若在 12:00 因
+ *    daily_limit 收工却返回 0，就会立即唤醒、立刻再收工，形成忙循环。
+ *    所以这里按小时数**独立**判断：还没到开窗时刻就是今天，已过就是明天。
+ *
+ * 2. **不能**睡到「次日 00:05」。窗口是 08:00–23:00，若在 00:05 醒来发现
+ *    窗口关、又睡到次日 00:05，会陷入「00:05 醒 → 窗口关 → 再睡 24 小时」
+ *    的死循环，功能静默停摆。睡到 08:05 同时也满足「等 daily_limit 归零」。
+ */
+export function nextWindowOpenMs(serverNowSec: number, window: TravelWindow, nowMs: number): number {
+  const base = serverNowSec > 0 ? new Date(serverNowSec * 1000) : new Date(nowMs)
+  const next = new Date(base)
+  next.setHours(window.startHour, 5, 0, 0)
+  if (next.getTime() <= base.getTime()) next.setDate(next.getDate() + 1)
+  if (serverNowSec <= 0) return next.getTime()
+  // 用差值换算成本地时刻，避免把服务端时间戳当本机时区来读。
+  const deltaSec = Math.floor((next.getTime() - base.getTime()) / 1000)
+  return nowMs + deltaSec * 1000
+}
+
 /** 把服务端 status 的最新事实同步进本地 entry。 */
 function syncFromStatus(entry: TravelState, status: WorkBuddyTravelStatus): void {
   entry.recordId = status.recordId > 0 ? status.recordId : entry.recordId
@@ -233,6 +258,13 @@ export class WorkBuddyTravelService {
   private readonly store: TravelCredentialStore
   private readonly client: WorkBuddyUpstreamClient
   private readonly window: TravelWindow
+  /**
+   * 最近一次从服务端读到的 server_now（秒）。
+   *
+   * 供 `finishClaimed` / `onFailure` 在**没有**当轮 status 可用时，
+   * 仍能按服务端时区算出「下一次可派时刻」，而不是退回本机时钟。
+   */
+  private lastServerNow = 0
 
   constructor(store: TravelCredentialStore, client: WorkBuddyUpstreamClient, window: TravelWindow = DEFAULT_TRAVEL_WINDOW) {
     this.store = store
@@ -243,7 +275,9 @@ export class WorkBuddyTravelService {
   /** 查一次服务端旅行状态（只读）。 */
   async getStatus(): Promise<WorkBuddyTravelStatus> {
     const credential = await this.store.resolve()
-    return await this.client.fetchTravelStatus(credential)
+    const status = await this.client.fetchTravelStatus(credential)
+    if (status.serverNow > 0) this.lastServerNow = status.serverNow
+    return status
   }
 
   /**
@@ -257,9 +291,9 @@ export class WorkBuddyTravelService {
     if (entry.retryAfterMs !== undefined && nowMs < entry.retryAfterMs) {
       return { acted: false, message: entry.result ?? '等待重试', done: false, nextWakeAtMs: entry.retryAfterMs }
     }
-    // 连续失败过多：暂停到次日，别死磕。
+    // 连续失败过多：暂停到下次可派时刻，别死磕。
     if (entry.failures >= MAX_CONSECUTIVE_FAILURES) {
-      return this.rest(entry, '连续失败过多，暂停到次日', 'claimed', nowMs)
+      return this.rest(entry, '连续失败过多，暂停到下次可派', 'claimed', nowMs, 0)
     }
 
     let status: WorkBuddyTravelStatus
@@ -300,12 +334,12 @@ export class WorkBuddyTravelService {
       return await this.claim(entry, status, nowMs)
     }
 
-    // 3) 空闲：能否再派由服务端说了算。
+    // 3) 空闲：能否再派由服务端说了算（实测上限为 1 次/账号/天，领取后不重置）。
     if (status.dailyLimitReached) {
-      return this.rest(entry, '今日已派（达每日上限）', 'daily-limit', nowMs)
+      return this.rest(entry, '今日已派（达每日上限）', 'daily-limit', nowMs, status.serverNow)
     }
     if (!withinWindow(status.serverNow, this.window)) {
-      return this.rest(entry, '不在可派时段', 'window', nowMs)
+      return this.rest(entry, '不在可派时段', 'window', nowMs, status.serverNow)
     }
     return await this.depart(entry, nowMs)
   }
@@ -341,16 +375,31 @@ export class WorkBuddyTravelService {
     return { ok: outcome.acted, message: outcome.message, status }
   }
 
-  /** 今日收工：睡到次日窗口开启。 */
-  private rest(entry: TravelState, message: string, reason: TravelState['doneReason'], nowMs: number): TravelTickOutcome {
+  /**
+   * 今日收工：睡到**下一次可派时刻**（服务端 08:05）。
+   *
+   * 必须睡到窗口开启，而不是「次日 00:05」——窗口是 08:00–23:00，
+   * 若在 00:05 醒来发现窗口关、又睡到次日 00:05，会陷入
+   * 「00:05 醒 → 窗口关 → 再睡 24 小时」的死循环，功能静默停摆。
+   * 睡到 08:05 同时也满足「等次日 daily_limit 归零」，一举两得。
+   */
+  private rest(
+    entry: TravelState,
+    message: string,
+    reason: TravelState['doneReason'],
+    nowMs: number,
+    serverNowSec: number,
+  ): TravelTickOutcome {
     entry.done = true
     entry.doneReason = reason
     entry.attemptedAtMs = nowMs
     entry.result = message
-    // 次日 00:05 左右再由兜底定时器叫醒；精确到点由调用方重排。
-    const next = new Date(nowMs)
-    next.setHours(24, 5, 0, 0)
-    return { acted: false, message, done: true, nextWakeAtMs: next.getTime() }
+    return {
+      acted: false,
+      message,
+      done: true,
+      nextWakeAtMs: nextWindowOpenMs(serverNowSec, this.window, nowMs),
+    }
   }
 
   /**
@@ -378,23 +427,29 @@ export class WorkBuddyTravelService {
     if (credit > 0) entry.claimedCredit = credit
     const text = credit > 0 ? `${message}，+${credit} 积分` : message
     entry.result = text
-    // 次日 00:05 醒，届时服务端已把 daily_limit 归零，可以再派。
-    const next = new Date(nowMs)
-    next.setHours(24, 5, 0, 0)
-    return { acted: true, message: text, done: true, nextWakeAtMs: next.getTime() }
+    // 睡到下次可派时刻（服务端 08:05）。此时 daily_limit 早已归零，可以再派。
+    return {
+      acted: true,
+      message: text,
+      done: true,
+      nextWakeAtMs: nextWindowOpenMs(this.lastServerNow, this.window, nowMs),
+    }
   }
 
-  /** 瞬时失败：退避重试；连续过多则暂停到次日。 */
+  /** 瞬时失败：退避重试；连续过多则暂停到下次可派时刻。 */
   private onFailure(entry: TravelState, message: string, nowMs: number): TravelTickOutcome {
     entry.failures += 1
     entry.attemptedAtMs = nowMs
     if (entry.failures >= MAX_CONSECUTIVE_FAILURES) {
       entry.done = true
       entry.doneReason = 'claimed'
-      entry.result = `${message}（连续失败 ${entry.failures} 次，暂停到次日）`
-      const next = new Date(nowMs)
-      next.setHours(24, 5, 0, 0)
-      return { acted: false, message: entry.result, done: true, nextWakeAtMs: next.getTime() }
+      entry.result = `${message}（连续失败 ${entry.failures} 次，暂停到下次可派）`
+      return {
+        acted: false,
+        message: entry.result,
+        done: true,
+        nextWakeAtMs: nextWindowOpenMs(this.lastServerNow, this.window, nowMs),
+      }
     }
     entry.retryAfterMs = nowMs + backoffMs(entry.failures)
     entry.result = message
@@ -453,8 +508,8 @@ export class WorkBuddyTravelService {
         return { acted: true, message, done: false, nextWakeAtMs: wakeAtFromStatus(status, nowMs) }
       }
       // 服务端权威判定：这个账号真的没有 Buddy。
-      if (res.noBuddy) return this.rest(entry, '无 Buddy，跳过旅行', 'no-buddy', nowMs)
-      if (res.dailyLimitReached) return this.rest(entry, '今日已派（达每日上限）', 'daily-limit', nowMs)
+      if (res.noBuddy) return this.rest(entry, '无 Buddy，跳过旅行', 'no-buddy', nowMs, this.lastServerNow)
+      if (res.dailyLimitReached) return this.rest(entry, '今日已派（达每日上限）', 'daily-limit', nowMs, this.lastServerNow)
       entry.result = `派发失败：${res.message}`
       return this.onFailure(entry, entry.result, nowMs)
     }
