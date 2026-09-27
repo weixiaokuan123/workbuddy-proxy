@@ -29,6 +29,8 @@ export interface SigninScheduleEntry {
   attemptedAtMs?: number
   /** 未领取时的下次允许重试时刻（ms）；未到点前 runIfDue 直接跳过，避免空转。 */
   retryAfterMs?: number
+  /** 本次连续失败次数（成功或跨天后清零），用于失败退避阶梯。 */
+  failStreak?: number
 }
 
 export type SigninStateStore = Record<string, SigninScheduleEntry>
@@ -54,6 +56,47 @@ const FAIL_WRITE_BACKOFF_MS = 60 * 60 * 1000
  * 冷却后按小时重试，上游调用与写盘各降约 12 倍。
  */
 const RETRY_COOLDOWN_MS = 60 * 60 * 1000
+
+/**
+ * **失败**时的重试退避阶梯。
+ *
+ * 与「未领取」不同，失败更需要快速重试：网络抖动、上游 5xx 这类瞬时问题
+ * 只要在当天窗口内重试一次就能把积分拿到手。所以不能沿用 1 小时的
+ * RETRY_COOLDOWN_MS —— 那样 22:30 的一次抖动会被推到 23:30，而窗口 23:00 就关，
+ * 当天的签到积分直接丢了。
+ *
+ * 于是做成指数退避：前几次仍按 tick 节奏（5 分钟）重试，救得回瞬时故障；
+ * 连续失败到后面才逐步拉长，永久性失败（如 token 已被桌面端加密）最终收敛到
+ * 1 小时一次。配合 {@link clampToWindowEnd} 保证永不越过窗口关闭时刻。
+ */
+const FAIL_RETRY_STEPS_MS: readonly number[] = [
+  5 * 60 * 1000,        // 第 1 次失败后：5 分钟
+  15 * 60 * 1000,       // 第 2 次：15 分钟
+  45 * 60 * 1000,       // 第 3 次：45 分钟
+  RETRY_COOLDOWN_MS,    // 第 4 次及以后：1 小时
+]
+
+/** 第 n 次连续失败应等待多久（n 从 1 起，超出阶梯则用最后一档）。 */
+function failRetryDelayMs(consecutiveFailures: number): number {
+  const i = Math.max(0, consecutiveFailures - 1)
+  return FAIL_RETRY_STEPS_MS[Math.min(i, FAIL_RETRY_STEPS_MS.length - 1)]
+}
+
+/**
+ * 把冷却时刻压到「窗口关闭前一点点」以内。
+ *
+ * 无论退避算出多久，都不允许把下一次重试推到当天窗口之外——否则一次瞬时失败
+ * 就可能让当天的积分永远拿不到，而这是用户唯一真正在意的结果。
+ */
+function clampToWindowEnd(retryAtMs: number, now: Date, endHour: number): number {
+  const endSec = Math.min(86399, Math.max(0, endHour * 3600 - 1))
+  const endOfWindow = new Date(now)
+  endOfWindow.setHours(0, 0, 0, 0)
+  endOfWindow.setSeconds(endSec)
+  // 已过窗口关闭点就别再排了，保持原值（runIfDue 会因跨天而重建 entry）
+  if (now.getTime() > endOfWindow.getTime()) return retryAtMs
+  return Math.min(retryAtMs, endOfWindow.getTime())
+}
 
 function localDate(d = new Date()): string {
   const y = d.getFullYear()
@@ -177,6 +220,8 @@ export class SigninScheduler {
       entry.claimed = outcome.claimed || outcome.already
       entry.result = outcome.message
       entry.attemptedAtMs = Date.now()
+      // 恢复即清零失败计数，否则一次偶发抖动会让后续的永久失败退避被"喂饱"
+      delete entry.failStreak
       // 未领取则进入冷却，避免每 5 分钟空转调用上游并重写状态文件
       if (entry.claimed) delete entry.retryAfterMs
       else entry.retryAfterMs = entry.attemptedAtMs + RETRY_COOLDOWN_MS
@@ -189,12 +234,22 @@ export class SigninScheduler {
       // 仅当「距上次写盘超过 FAIL_WRITE_BACKOFF_MS」时才持久化一次，限制写盘频率。
       const message = String(error instanceof Error ? error.message : error)
       entry.result = `失败：${message}`
-      entry.attemptedAtMs = Date.now()
-      // 失败也必须进入冷却，否则 runIfDue 的 retryAfterMs 门禁永远拦不住它：
+      // 用 runIfDue 传进来的 now，而不是 Date.now()：runIfDue 的其余判断
+      // （ensureEntry / isDue / retryAfterMs 门禁）都以 now 为准，这里混用真实
+      // 时钟会让「注入时刻测试」和「门禁判定」对不上。
+      entry.attemptedAtMs = now.getTime()
+      // 失败也必须进入退避，否则 runIfDue 的 retryAfterMs 门禁永远拦不住它：
       // 像 live-cn 这种「token 已被桌面端加密」的**永久性**失败会每 5 分钟重试一次，
       // 每天 288 次无谓的上游请求 + 288 条日志（两个 live 目标就是 576 次/天）。
-      // 跨天由 ensureEntry 重建 entry（不带 retryAfterMs），所以冷却不会卡到第二天。
-      entry.retryAfterMs = entry.attemptedAtMs + RETRY_COOLDOWN_MS
+      //
+      // 但退避必须「快速起步」且「不越过窗口」：瞬时故障要能在当天救回来，
+      // 22:30 的抖动不能因为 1 小时冷却被推到 23:30（窗口已关，积分就丢了）。
+      entry.failStreak = (entry.failStreak ?? 0) + 1
+      entry.retryAfterMs = clampToWindowEnd(
+        entry.attemptedAtMs + failRetryDelayMs(entry.failStreak),
+        now,
+        this.options.endHour,
+      )
       const last = this.lastFailWriteMs[target] ?? 0
       const backoff = this.options.failWriteBackoffMs ?? FAIL_WRITE_BACKOFF_MS
       const cooled = Date.now() - last < backoff
