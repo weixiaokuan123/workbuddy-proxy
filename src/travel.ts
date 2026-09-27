@@ -353,10 +353,22 @@ export class WorkBuddyTravelService {
     return { acted: false, message, done: true, nextWakeAtMs: next.getTime() }
   }
 
-  /** 领取成功后：记分，60 秒后重查以便继续派。 */
+  /**
+   * 领取成功后收尾。
+   *
+   * **实测确认（2026-09-27）：每日派遣上限是「每账号每天 1 次」的硬性次数上限，
+   * 领取后不会重置。** 证据：领取后 status 为 `state=idle, daily_limit=true`，
+   * 再次 depart 被拒 `message="daily limit reached", code=400`；且 config 响应里
+   * **没有任何积分预算字段**（只有 locations / intro_slogans / server_now），
+   * 所以不是「额度用完」而是「次数用完」。
+   *
+   * 因此这里**不安排 60 秒后重查**——重查必然仍是 daily_limit，纯属浪费请求。
+   * 直接睡到次日：想再派就等第二天，服务端会自己把 daily_limit 归零。
+   * 保留 `REDISPATCH_DELAY_MS` 供将来服务端若改为可重复派遣时使用。
+   */
   private finishClaimed(entry: TravelState, credit: number, message: string, nowMs: number): TravelTickOutcome {
-    entry.done = false
-    entry.doneReason = undefined
+    entry.done = true
+    entry.doneReason = 'claimed'
     entry.departed = true
     entry.state = 'idle'
     entry.claimAttempts = 0
@@ -366,7 +378,10 @@ export class WorkBuddyTravelService {
     if (credit > 0) entry.claimedCredit = credit
     const text = credit > 0 ? `${message}，+${credit} 积分` : message
     entry.result = text
-    return { acted: true, message: text, done: false, nextWakeAtMs: nowMs + REDISPATCH_DELAY_MS }
+    // 次日 00:05 醒，届时服务端已把 daily_limit 归零，可以再派。
+    const next = new Date(nowMs)
+    next.setHours(24, 5, 0, 0)
+    return { acted: true, message: text, done: true, nextWakeAtMs: next.getTime() }
   }
 
   /** 瞬时失败：退避重试；连续过多则暂停到次日。 */

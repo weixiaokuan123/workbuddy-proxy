@@ -489,6 +489,10 @@ async function main(): Promise<void> {
     return out
   }
 
+  // 每日签到目标表。声明提前到 shim 循环之前：下面的 signinStatus 闭包要在
+  // **调用时**读它（HTTP 请求发生在启动完成之后，那时下面已填好内容）。
+  const signinTargets: Array<{ id: string; label: string; signin: WorkBuddySigninService; scheduler: SigninScheduler }> = []
+
   const shims: WorkBuddyShim[] = []
   for (const rt of runtimes) {
     const token = await loadOrCreateKey(rt.keyFile)
@@ -511,6 +515,27 @@ async function main(): Promise<void> {
         let error: string | undefined
         try { view = await rt.signin.getStatus() }
         catch (e) { error = e instanceof Error ? e.message : String(e) }
+
+        // 逐目标明细。
+        //
+        // 为什么必须有：面板上某个区域只有一张卡片，而卡片里的「签到」此前
+        // 显示的是**该端口自身**的状态。cn 端口自身是 live-cn，它的 token
+        // 已被桌面端加密、永远失败——于是面板上写着「签到失败」，而实际上
+        // 同区另外几个账号签到得好好的。给出明细，面板才能显示真实情况。
+        const targets = []
+        for (const t of signinTargets) {
+          const e = await t.scheduler.entry(t.id).catch(() => undefined)
+          targets.push({
+            id: t.id,
+            label: t.label,
+            scheduledAt: e === undefined ? undefined : formatSec(e.runAtSec),
+            claimedToday: e?.claimed ?? false,
+            lastResult: e?.result ?? '',
+            isThisPort: t.id === rt.id,
+          })
+        }
+        const claimedCount = targets.filter(t => t.claimedToday).length
+
         return {
           runtime: rt.id,
           label: rt.label,
@@ -519,12 +544,46 @@ async function main(): Promise<void> {
           claimedToday: entry.claimed,
           lastResult: entry.result,
           view,
+          targets,
+          claimedCount,
+          totalCount: targets.length,
           ...(error === undefined ? {} : { error }),
         }
       } : undefined,
       signinClaim: SIGNIN_ENABLED ? async () => {
-        const outcome = await rt.scheduler.runNow(rt.id, () => rt.signin.claim())
-        return { runtime: rt.id, label: rt.label, region: rt.region, ...outcome }
+        // 先试本端口；凭据不可用时（典型：live token 已被加密）改为领取该区域
+        // 所有尚未领取的目标，否则面板上点「立即签到」永远失败。
+        try {
+          await rt.signin.getStatus()
+          const outcome = await rt.scheduler.runNow(rt.id, () => rt.signin.claim())
+          return { runtime: rt.id, label: rt.label, region: rt.region, ...outcome }
+        } catch (e) {
+          const pending = signinTargets.filter(t => {
+            if (t.id === rt.id) return false
+            void t.scheduler.entry(t.id).then(en => en).catch(() => undefined)
+            return true
+          })
+          if (pending.length === 0) {
+            return { runtime: rt.id, label: rt.label, region: rt.region, ok: false, message: e instanceof Error ? e.message : String(e) }
+          }
+          const results: Array<{ id: string; label: string; ok: boolean; message: string }> = []
+          for (const t of pending) {
+            try {
+              const o = await t.scheduler.runNow(t.id, () => t.signin.claim())
+              results.push({ id: t.id, label: t.label, ok: o.ok !== false, message: o.message ?? (o.claimed ? '已领取' : '今日已领') })
+            } catch (err) {
+              results.push({ id: t.id, label: t.label, ok: false, message: err instanceof Error ? err.message : String(err) })
+            }
+          }
+          return {
+            runtime: rt.id,
+            label: rt.label,
+            region: rt.region,
+            ok: results.some(r => r.ok),
+            message: `本端口不可用，已改为领取该区域 ${results.length} 个账号`,
+            results,
+          }
+        }
       } : undefined,
       // 注意：这里只判断 TRAVEL_ENABLED，**不能**在创建时求值 travelApi ——
       // 旅行块在本循环之后才运行，那时 travelApi 还是 undefined。
@@ -551,7 +610,6 @@ async function main(): Promise<void> {
   // 否则它们会永远收不到每日积分。
   // **必须包含 backfilledStores**：live 不可用时被去重、又因回填而重新可用的
   // 账号，同样要拿到每日签到积分，否则回填只恢复了对话与旅行，签到却漏了。
-  const signinTargets: Array<{ id: string; label: string; signin: WorkBuddySigninService; scheduler: SigninScheduler }> = []
   const signinSeen = new Set<string>()
   for (const rt of runtimes) {
     if (rt.accountKey === undefined && !signinSeen.has(rt.id)) {

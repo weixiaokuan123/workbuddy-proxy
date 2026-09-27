@@ -96,27 +96,36 @@ test('idle + 未达上限 → 派遣（buddy_id=0 也要派，这是曾被写反
   assert.ok([1, 4].includes(rec.departs[0] as number), '选点应在 config 给出的地点中')
 })
 
-test('领取成功后 60 秒重查，能再次派遣（形成循环）', async () => {
+test('领取成功后收工到次日（每日上限不因领取而重置）', async () => {
+  // 实测结论：每账号每天只能派 1 次，领取后 daily_limit 仍为 true
+  // （服务端拒绝文案 "daily limit reached"，且 config 无任何积分预算字段）。
+  // 所以领取后不该安排「60 秒后重查」——重查必然仍是已达上限，纯浪费请求。
   const rec = fresh()
   const entry = createTravelState(TODAY)
-  // 第一步：已到点 → 领取成功
-  const svc1 = makeService({
+  const svc = makeService({
     status: statusOf({ state: 'arrived', recordId: 42, locationName: '古镇客栈', rewardCredit: 9 }),
     recorder: rec,
   })
-  const t1 = await svc1.tick(entry)
-  assert.equal(rec.claims.length, 1)
-  assert.equal(t1.done, false, '领取后不应收工，要继续循环')
-  assert.ok(t1.nextWakeAtMs !== undefined)
-  const gap = (t1.nextWakeAtMs as number) - Date.now()
-  assert.ok(gap > 0 && gap <= REDISPATCH_DELAY_MS + 2000, `应约 ${REDISPATCH_DELAY_MS}ms 后重查，实际 ${gap}`)
+  const t1 = await svc.tick(entry)
 
-  // 第二步：60 秒后服务端已回落 daily_limit → 再次派遣
-  rec.departs.length = 0
-  const svc2 = makeService({ status: statusOf({ state: 'idle', dailyLimitReached: false }), recorder: rec })
-  const t2 = await svc2.tick(entry)
-  assert.equal(rec.departs.length, 1, '领取后应能再次派遣')
-  assert.equal(t2.acted, true)
+  assert.equal(rec.claims.length, 1)
+  assert.equal(t1.done, true, '领取后今日收工')
+  assert.equal(entry.doneReason, 'claimed')
+  // claim 返回的 rewardCredit 优先于 status 里的（mock 默认返回 7）
+  assert.equal(entry.claimedCredit, 7, '奖励已记账')
+  const gap = (t1.nextWakeAtMs as number) - Date.now()
+  assert.ok(gap > 3600_000, `应睡到次日，实际仅 ${Math.round(gap / 60000)} 分钟`)
+})
+
+test('已达每日上限且空闲 → 睡到次日，不再尝试派遣', async () => {
+  const rec = fresh()
+  const svc = makeService({ status: statusOf({ state: 'idle', dailyLimitReached: true }), recorder: rec })
+  const entry = createTravelState(TODAY)
+  const out = await svc.tick(entry)
+  assert.equal(rec.departs.length, 0, '已达上限时不应再发 depart')
+  assert.equal(out.done, true)
+  assert.equal(entry.doneReason, 'daily-limit')
+  assert.ok((out.nextWakeAtMs as number) - Date.now() > 3600_000, '应睡到次日')
 })
 
 test('idle + 已达每日上限 → 不派，今日收工', async () => {
@@ -172,7 +181,7 @@ test('traveling 已过到达时间 → 领取', async () => {
   const out = await svc.tick(entry)
 
   assert.deepEqual(rec.claims, [66])
-  assert.equal(out.done, false, '领取后继续循环')
+  assert.equal(out.done, true, '领取后今日收工（每日上限 1 次/账号）')
   assert.equal(entry.claimedCredit, 7)
 })
 
@@ -192,7 +201,7 @@ test('claim 回 not arrived yet → 按余量重试，不收工', async () => {
   assert.ok((out.nextWakeAtMs as number) > Date.now())
 })
 
-test('claim 回 nothing to claim → 视为已结算，继续循环', async () => {
+test('claim 回 nothing to claim → 视为已结算，今日收工', async () => {
   const rec = fresh()
   const svc = makeService({
     status: statusOf({ state: 'arrived', recordId: 99 }),
@@ -202,7 +211,8 @@ test('claim 回 nothing to claim → 视为已结算，继续循环', async () =
   const entry = createTravelState(TODAY)
   const out = await svc.tick(entry)
 
-  assert.equal(out.done, false, '已结算后还要继续派')
+  assert.equal(out.done, true)
+  assert.equal(entry.doneReason, 'claimed')
   assert.equal(entry.claimedAtMs !== undefined, true)
 })
 
@@ -249,7 +259,7 @@ test('窗口只挡派遣：夜里落地的行程照常领取', async () => {
   })
   const out = await svc.tick(createTravelState(TODAY))
   assert.deepEqual(rec.claims, [5], '夜间落地必须能领取')
-  assert.equal(out.done, false)
+  assert.equal(out.done, true, '领取后今日收工（每日上限 1 次/账号）')
 })
 
 test('withinWindow 边界：起始小时含、结束小时不含', () => {
