@@ -21,6 +21,7 @@ import { WorkBuddyUpstreamClient, travelSupported, type WorkBuddyRegion } from '
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { WorkBuddySigninService } from './signin.ts'
 import { SigninScheduler, formatSec } from './scheduler.ts'
+import { targetsForRegion as byRegion, targetsExcept } from './signin-region.ts'
 import {
   WorkBuddyTravelService,
   createTravelState,
@@ -516,7 +517,30 @@ async function main(): Promise<void> {
 
   // 每日签到目标表。声明提前到 shim 循环之前：下面的 signinStatus 闭包要在
   // **调用时**读它（HTTP 请求发生在启动完成之后，那时下面已填好内容）。
-  const signinTargets: Array<{ id: string; label: string; signin: WorkBuddySigninService; scheduler: SigninScheduler }> = []
+  //
+  // `region` 是**必须**的，不能省：这张表是全局的（所有区域的账号都在里面，
+  // 因为池化模式下每个账号都要独立签到），而 shim 是按区域建的。若消费时不按
+  // region 过滤，国际版端口会列出国内账号、点它的「立即签到」还会顺带领取国内
+  // 账号的积分。travelTargets 早就踩过这个坑并修好了（见 travelApi.status 的
+  // 过滤注释），这里必须一视同仁。
+  const signinTargets: Array<{
+    id: string
+    label: string
+    region: WorkBuddyRegion
+    signin: WorkBuddySigninService
+    scheduler: SigninScheduler
+  }> = []
+
+  /**
+   * 取属于某个区域的签到目标。
+   *
+   * 签到目标表是**全局**的（池化模式下每个账号都得独立签到，不分区域），
+   * 但 shim 是按区域建的。所以凡是「响应某个区域」的出口都必须先过这里，
+   * 否则国际版那张卡片会列出国内账号，点它的「立即签到」还会顺带领走国内积分。
+   *
+   * 规则实现在 `signin-region.ts`（纯函数 + 有测试），这里只做绑定。
+   */
+  const targetsForRegion = (region: WorkBuddyRegion) => byRegion(signinTargets, region)
 
   const shims: WorkBuddyShim[] = []
   for (const rt of runtimes) {
@@ -547,8 +571,11 @@ async function main(): Promise<void> {
         // 显示的是**该端口自身**的状态。cn 端口自身是 live-cn，它的 token
         // 已被桌面端加密、永远失败——于是面板上写着「签到失败」，而实际上
         // 同区另外几个账号签到得好好的。给出明细，面板才能显示真实情况。
+        //
+        // 必须按 region 过滤：signinTargets 是全局的，不筛的话国际版那张卡片
+        // 会把国内账号也列进去（travel 那边早就因为同样的问题修过了）。
         const targets = []
-        for (const t of signinTargets) {
+        for (const t of targetsForRegion(rt.region)) {
           const e = await t.scheduler.entry(t.id).catch(() => undefined)
           targets.push({
             id: t.id,
@@ -583,10 +610,12 @@ async function main(): Promise<void> {
           const outcome = await rt.scheduler.runNow(rt.id, () => rt.signin.claim())
           return { runtime: rt.id, label: rt.label, region: rt.region, ...outcome }
         } catch (e) {
-          const pending = signinTargets.filter(t => {
-            if (t.id === rt.id) return false
-            void t.scheduler.entry(t.id).then(en => en).catch(() => undefined)
-            return true
+          // 兜底：领取**本区域**所有尚未领取的目标。
+          // 必须按 region 过滤——否则在国际版端口点一次「立即签到」，
+          // 会顺带领取国内账号的积分，这不只是显示错位，是真的动了别的区。
+          const pending = targetsExcept(targetsForRegion(rt.region), rt.id).map(t => {
+            void t.scheduler.entry(t.id).catch(() => undefined)
+            return t
           })
           if (pending.length === 0) {
             return { runtime: rt.id, label: rt.label, region: rt.region, ok: false, message: e instanceof Error ? e.message : String(e) }
@@ -642,7 +671,7 @@ async function main(): Promise<void> {
   for (const rt of runtimes) {
     if (rt.accountKey === undefined && !signinSeen.has(rt.id)) {
       signinSeen.add(rt.id)
-      signinTargets.push({ id: rt.id, label: rt.label, signin: rt.signin, scheduler: rt.scheduler })
+      signinTargets.push({ id: rt.id, label: rt.label, region: rt.region, signin: rt.signin, scheduler: rt.scheduler })
     }
   }
   if (!ACCOUNT_PORTS_ENABLED) {
@@ -652,6 +681,7 @@ async function main(): Promise<void> {
       signinTargets.push({
         id: a.id,
         label: a.label,
+        region: a.region,
         signin: new WorkBuddySigninService(a.store, client),
         scheduler: schedulerOf(a.region),
       })
