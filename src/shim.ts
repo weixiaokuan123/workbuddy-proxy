@@ -19,8 +19,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Readable } from 'node:stream'
 import type { WorkBuddyAuthStatus, WorkBuddyCredential } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
-import { parseRateLimitResetMs, prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
-import { CreditCache } from './credit-cache.ts'
+import { parseRateLimitResetMs, prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind, type WorkBuddyCreditPackage, type WorkBuddyCredits } from './upstream.ts'
+import { CreditCache, type CachedCredits } from './credit-cache.ts'
 import { WORKBUDDY_CONNECT_VERSION } from './version.ts'
 import { redact, redactPaths } from './redact.ts'
 
@@ -120,6 +120,20 @@ export interface PoolEntryView {
   credits?: number
   /** 积分包数量。 */
   packages?: number
+  /**
+   * 逐个积分包的明细（各自的到期 / 刷新时刻与剩余额度）。
+   *
+   * 过去这里只透传了 `packages.length` 一个计数，面板因此完全看不到到期信息——
+   * 而上游其实早就解析好了（upstream.ts 的 WorkBuddyCreditPackage）。这层是纯透传，
+   * 不新增任何上游请求：明细本来就在 creditCache 里躺着。
+   *
+   * 由面板按到期日聚合展示；本代理只负责如实报事实，不决定怎么呈现。
+   */
+  creditPackages?: readonly CreditPackageView[]
+  /** 3 天内到期的积分数；> 0 表示有积分即将作废（上游已按此口径算好）。 */
+  expiringSoon?: number
+  /** 最近一个包的到期时刻（ms）；月度包不参与「到期」判定。 */
+  nearestExpiryMs?: number
   /** 积分是否来自缓存（未重新拉取）。 */
   creditsCached?: boolean
   /** 积分是否为上游失败后的降级旧值。 */
@@ -129,6 +143,58 @@ export interface PoolEntryView {
   /** 积分查询失败时的原因（该条目不因此消失）。 */
   creditsError?: string
 }
+
+/**
+ * 上报给面板的积分包（线上格式），比上游的 WorkBuddyCreditPackage 窄。
+ *
+ * **刻意不带 packageName**：面板按到期日聚合，从不显示包名，而实测它占了
+ * /status 体积增量的三分之一（2.2 KB / 7.2 KB，56 个包）。少发一个没人用的
+ * 字段，既省流量，也少留一个 XSS 面——将来谁顺手写个 title="${p.packageName}"
+ * 就会把上游文本插进 HTML，而上游文本是不可信的。
+ */
+export interface CreditPackageView {
+  remain: number
+  size: number
+  monthly: boolean
+  refreshAtMs?: number
+  expiresAtMs?: number
+}
+
+/**
+ * 上游包 → 线上包。
+ *
+ * 刻意**拷贝**而不是直接引用 creditCache 里的对象：缓存是全进程共享的，
+ * 引用一旦被下游改动就会污染缓存（同一时刻所有并发 /status 都读到脏数据）。
+ */
+function toPackageViews(packages: readonly WorkBuddyCreditPackage[]): CreditPackageView[] {
+  return packages.map(p => ({
+    remain: p.remain,
+    size: p.size,
+    monthly: p.monthly,
+    ...(p.refreshAtMs === undefined ? {} : { refreshAtMs: p.refreshAtMs }),
+    ...(p.expiresAtMs === undefined ? {} : { expiresAtMs: p.expiresAtMs }),
+  }))
+}
+
+/**
+ * 把一次 creditCache 查询的结果铺到池条目上。
+ *
+ * 多账号池与单账号两条分支都走这里——以前是两段几乎一样的字面量赋值，
+ * 加字段时很容易只改一处，另一处静默缺字段（表现为「有的账号没有到期信息」）。
+ */
+function applyCredits(entry: PoolEntryView, result: CachedCredits): void {
+  entry.credits = result.credits.total
+  entry.packages = result.credits.packages.length
+  entry.creditPackages = toPackageViews(result.credits.packages)
+  entry.expiringSoon = result.credits.expiringSoon
+  entry.nearestExpiryMs = result.credits.nearestExpiryMs
+  entry.creditsCached = result.cached
+  entry.creditsStale = result.stale
+  entry.creditsAgeSec = Math.round(result.ageMs / 1000)
+}
+
+/** 仅供测试引用：toPackageViews 本身不对外暴露。 */
+export const toPackageViewsForTest = toPackageViews
 
 export interface WorkBuddyShimOptions {
   region: 'cn' | 'global'
@@ -434,14 +500,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         try {
           const credential = await c.store.resolve()
           const result = await creditCache.get(credential, cred => options.client.fetchCredits(cred))
-          return {
-            ...base,
-            credits: result.credits.total,
-            packages: result.credits.packages.length,
-            creditsCached: result.cached,
-            creditsStale: result.stale,
-            creditsAgeSec: Math.round(result.ageMs / 1000),
-          }
+          applyCredits(base, result)
+          return base
         } catch (error: unknown) {
           return { ...base, creditsError: error instanceof Error ? error.message : String(error) }
         }
@@ -468,11 +528,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         try {
           const credential = await store.resolve()
           const result = await creditCache.get(credential, c => options.client.fetchCredits(c))
-          entry.credits = result.credits.total
-          entry.packages = result.credits.packages.length
-          entry.creditsCached = result.cached
-          entry.creditsStale = result.stale
-          entry.creditsAgeSec = Math.round(result.ageMs / 1000)
+          applyCredits(entry, result)
         } catch (error: unknown) {
           entry.creditsError = error instanceof Error ? error.message : String(error)
         }
