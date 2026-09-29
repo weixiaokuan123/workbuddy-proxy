@@ -196,6 +196,66 @@ function applyCredits(entry: PoolEntryView, result: CachedCredits): void {
 /** 仅供测试引用：toPackageViews 本身不对外暴露。 */
 export const toPackageViewsForTest = toPackageViews
 
+/**
+ * self（本端口账号）的健康状态。
+ *
+ * 背景：桌面端自 2026-09 起把 live token 加密，`resolve()` 必然失败；而它一直
+ * **无条件排第一**。实测每个请求的日志都是「第 2/5 个」——也就是你日常每一次
+ * 调用都先撞一次注定失败的尝试才落到账号库。
+ *
+ * 这里记住「self 解不开」这件事并在短期内跳过它，但**必须可自愈**：桌面端重新
+ * 登录后 live 又能用，所以到 `nextProbeAtMs` 一定重探一次，成功就清标记。
+ * 不能做成永久跳过——那会让重新登录的 live 永远用不上。
+ */
+export interface SelfHealth {
+  selfBroken: boolean
+  /** 到这个时刻之前都跳过 self；到点后重探。 */
+  nextProbeAtMs: number
+}
+
+/** 重探间隔：兼顾「少白试」与「重新登录后能较快被发现」。 */
+export const SELF_PROBE_MS = 5 * 60_000
+
+export interface Attempt {
+  id: string
+  label: string
+  store: CredentialStoreLike
+}
+
+/**
+ * 构造尝试顺序：self 在前（除非已知解不开），其余按「可用优先、冷却剩余升序」。
+ *
+ * 抽成纯函数是为了可测：这段排序以前内联在请求处理里，改动无从验证。
+ */
+export function buildAttempts(args: {
+  selfId: string
+  candidates: () => ReadonlyArray<{ id: string; label: string; store: CredentialStoreLike }>
+  registry: { isLimited: (id: string) => boolean; remainingMs: (id: string) => number }
+  health: SelfHealth
+  nowMs: number
+}): Attempt[] {
+  const { selfId, candidates, registry, health, nowMs } = args
+  const all = candidates()
+  const self = all.find(c => c.id === selfId)
+  const attempts: Attempt[] = []
+
+  // 唯一候选时绝不能跳过，否则一个账号都试不到
+  const skipSelf = self !== undefined && all.length > 1
+    && health.selfBroken && nowMs < health.nextProbeAtMs
+  if (self !== undefined && !skipSelf) attempts.push({ id: self.id, label: self.label, store: self.store })
+
+  const rest = all
+    .filter(c => c.id !== selfId)
+    .map(c => ({ candidate: c, limited: registry.isLimited(c.id), remaining: registry.remainingMs(c.id) }))
+    // 可用账号在前；都可用按顺序稳定排序，冷却中的按剩余时间升序
+    .sort((a, b) => {
+      if (a.limited !== b.limited) return a.limited ? 1 : -1
+      return a.remaining - b.remaining
+    })
+  for (const r of rest) attempts.push({ id: r.candidate.id, label: r.candidate.label, store: r.candidate.store })
+  return attempts
+}
+
 export interface WorkBuddyShimOptions {
   region: 'cn' | 'global'
   port: number
@@ -553,6 +613,15 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     writeJson(res, 200, payload)
   }
 
+  /**
+   * 本端口账号（self）的健康标记。每个 region 一个实例。
+   *
+   * 桌面端把 live token 加密后，`resolve()` 每次都失败，而 self 又排第一——
+   * 于是每个请求都白白先撞一次。这里记住失败并在 SELF_PROBE_MS 内跳过，
+   * 到点自动重探，所以桌面端重新登录后能自己恢复。
+   */
+  const selfHealth: SelfHealth = { selfBroken: false, nextProbeAtMs: 0 }
+
   async function chatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!isJsonContentType(req)) {
       writeOpenAIError(res, 415, 'unsupported_media_type', 'Content-Type 必须是 application/json')
@@ -574,25 +643,15 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     const attempts: Array<{ id: string; label: string; store: CredentialStoreLike }> = []
     if (options.failover !== undefined) {
       const { selfId, candidates, registry } = options.failover
-      const all = candidates()
-      const self = all.find(c => c.id === selfId)
-      if (self !== undefined) attempts.push({ id: self.id, label: self.label, store: self.store })
+      attempts.push(...buildAttempts({ selfId, candidates, registry, health: selfHealth, nowMs: Date.now() }))
 
-      const rest = all
-        .filter(c => c.id !== selfId)
-        .map(c => ({ candidate: c, limited: registry.isLimited(c.id), remaining: registry.remainingMs(c.id) }))
-        // 可用账号在前；都可用按顺序稳定排序，冷却中的按剩余时间升序
-        .sort((a, b) => {
-          if (a.limited !== b.limited) return a.limited ? 1 : -1
-          return a.remaining - b.remaining
-        })
-      for (const r of rest) attempts.push({ id: r.candidate.id, label: r.candidate.label, store: r.candidate.store })
-
-      const dodging = rest.filter(r => r.limited)
+      const dodging = candidates()
+        .filter(c => c.id !== selfId && registry.isLimited(c.id))
+        .map(c => `${c.label} ${Math.ceil(registry.remainingMs(c.id) / 1000)}s`)
       if (dodging.length > 0) {
         logger?.info(
-          `workbuddy(${region}): 候选池 ${all.length} 个账号，其中 ${dodging.length} 个冷却中`
-          + `（${dodging.map(r => `${r.candidate.label} ${Math.ceil(r.remaining / 1000)}s`).join('、')}），已排在末尾`,
+          `workbuddy(${region}): 候选池 ${candidates().length} 个账号，其中 ${dodging.length} 个冷却中`
+          + `（${dodging.join('、')}），已排在末尾`,
         )
       }
     } else {
@@ -604,12 +663,24 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
 
     for (let i = 0; i < attempts.length; i++) {
       const attempt = attempts[i]!
+      const isSelf = options.failover !== undefined && attempt.id === options.failover.selfId
       let credential
       try {
         credential = await attempt.store.resolve()
+        // self 又能用了（桌面端重新登录过）：清标记，下个请求恢复首选
+        if (isSelf && selfHealth.selfBroken) {
+          selfHealth.selfBroken = false
+          logger?.info(`workbuddy(${region}): 本端口账号 ${attempt.label} 恢复可用，重新作为首选`)
+        }
       } catch (error: unknown) {
         // 该账号不可用（未登录/已删除/token 失效）：换下一个，不要因此打断整个请求
         lastFailure = { status: 401, kind: 'session_dead', message: String(error instanceof Error ? error.message : error) }
+        // self 解不开就记下来，短期跳过——否则每个请求都要先白撞它一次。
+        // 只对 self 记：账号库账号的失效是各自的，不该由一个失败推断另一个。
+        if (isSelf) {
+          selfHealth.selfBroken = true
+          selfHealth.nextProbeAtMs = Date.now() + SELF_PROBE_MS
+        }
         if (attempts.length > 1) {
           logger?.warn(`workbuddy(${region}): 账号 ${attempt.label} 不可用（${lastFailure.message.slice(0, 120)}），尝试下一个`)
           continue
