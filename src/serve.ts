@@ -313,12 +313,31 @@ async function main(): Promise<void> {
 
   // 签到状态按区域分文件：同一区域内的 live 与账号共用一份（target 名区分），
   // 不同区域分开——否则两个调度器各持内存副本整体回写时会互相覆盖（丢更新）。
-  const schedulerOf = (region: WorkBuddyRegion): SigninScheduler => new SigninScheduler({
-    stateFile: join(STATE_DIR, `signin-state-${region}.json`),
-    startHour: SIGNIN_START_HOUR,
-    endHour: SIGNIN_END_HOUR,
-    log: m => logger.info(m),
-  })
+  const schedulerByRegion = new Map<WorkBuddyRegion, SigninScheduler>()
+  // **每个区域只能有一个实例。**
+  //
+  // 这里原本写成 `=> new SigninScheduler({...})`，每次调用都新建。cn 区有
+  // 1 个 live + 4 个账号，于是同一个 signin-state-cn.json 被 5 个实例各持一份
+  // 内存副本；而 save() 是 writeFile(整个 store) 整份覆盖写，于是互相抹掉
+  // （丢更新）。
+  //
+  // 实测后果：重启后面板先显示 0/5，约 60 秒（SIGNIN_INITIAL_DELAY_MS）后
+  // 自己跳回 4/5——那 60 秒里 signinTick() 重新真签了一遍才补回来。
+  // 代价不只是面板难看，还白白消耗上游接口调用。
+  //
+  // 下面那行注释说的就是要避免这个，意图是一份，实现却成了五份。
+  const schedulerOf = (region: WorkBuddyRegion): SigninScheduler => {
+    const cached = schedulerByRegion.get(region)
+    if (cached !== undefined) return cached
+    const created = new SigninScheduler({
+      stateFile: join(STATE_DIR, `signin-state-${region}.json`),
+      startHour: SIGNIN_START_HOUR,
+      endHour: SIGNIN_END_HOUR,
+      log: m => logger.info(m),
+    })
+    schedulerByRegion.set(region, created)
+    return created
+  }
 
   const runtimes: RegionRuntime[] = []
   const accounts = new AccountStore(ACCOUNTS_FILE)

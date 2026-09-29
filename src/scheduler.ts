@@ -165,11 +165,28 @@ export class SigninScheduler {
 
   private async load(): Promise<void> {
     if (this.loaded) return
+    let raw: string
     try {
-      const raw = await readFile(this.options.stateFile, 'utf8')
+      raw = await readFile(this.options.stateFile, 'utf8')
+    } catch (error) {
+      // 只有「文件不存在」才是正常的从零开始。
+      // 别的错误（权限、被占用）若也当成空 store，紧接着 plan() 会因为
+      // before !== entry 而把空 store 写回去，把真实状态覆盖掉。
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        this.store = {}
+        this.loaded = true
+        return
+      }
+      throw error
+    }
+    try {
       this.store = JSON.parse(raw) as SigninStateStore
-    } catch {
-      this.store = {}
+    } catch (error) {
+      // 坏 JSON 同样不能当成空：那样一次 save 就会用全 false 覆写全天状态，
+      // 而旧内容里还有今天的 claimed 记录。宁可整个失败，也不能丢数据。
+      throw new Error(
+        `签到状态文件损坏（${this.options.stateFile}）：${error instanceof Error ? error.message : String(error)}`,
+      )
     }
     this.loaded = true
   }
