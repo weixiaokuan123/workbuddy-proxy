@@ -40,23 +40,28 @@ function account(over: Partial<StoredAccount> & { key: string }): StoredAccount 
 }
 
 // ---------- 1~2. 去重 ----------
+//
+// 注意：这里的 nickname 一律用**编造的**测试值。早先直接写了本机真实账号的
+// 昵称和手机号，测试文件进 git 后等于把账号标识公开了。
+// 这个测试关心的是「uid 相同 / 缺 uid 时按 displayName 比对」这条逻辑，
+// 用什么字符串都成立，没必要用真的。
 
 test('uid 相同的库记录被剔除', () => {
-  const live = identityKeysOfCredential('cn', { uid: 'u1', nickname: '示例昵称甲' })
-  assert.deepEqual(live, ['cn:uid:u1', 'cn:name:示例昵称甲'])
+  const live = identityKeysOfCredential('cn', { uid: 'u1', nickname: '测试昵称甲' })
+  assert.deepEqual(live, ['cn:uid:u1', 'cn:name:测试昵称甲'])
 
   const kept = dropLiveDuplicates(new Set(live), [
-    account({ key: 'a', uid: 'u1', nickname: '示例昵称甲' }),   // 与 live 同号 → 剔除
-    account({ key: 'b', uid: 'u2', nickname: '另一个号' }),   // 保留
+    account({ key: 'a', uid: 'u1', nickname: '测试昵称甲' }),   // 与 live 同号 → 剔除
+    account({ key: 'b', uid: 'u2', nickname: '测试昵称乙' }),   // 保留
   ])
   assert.deepEqual(kept.map(a => a.key), ['b'])
 })
 
 test('uid 缺失时用 displayName 兜底比对', () => {
-  const live = identityKeysOfCredential('cn', { uid: '', nickname: '13800138002' })
+  const live = identityKeysOfCredential('cn', { uid: '', nickname: '13800000000' })
   const kept = dropLiveDuplicates(new Set(live), [
-    account({ key: 'a', uid: '', nickname: '13800138002' }), // 同名 → 剔除
-    account({ key: 'b', uid: 'u9', nickname: '别的号' }),     // 保留
+    account({ key: 'a', uid: '', nickname: '13800000000' }), // 同名 → 剔除
+    account({ key: 'b', uid: 'u9', nickname: '13900000000' }), // 保留
   ])
   assert.deepEqual(kept.map(a => a.key), ['b'])
 })

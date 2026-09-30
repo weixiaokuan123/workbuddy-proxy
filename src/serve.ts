@@ -434,7 +434,7 @@ async function main(): Promise<void> {
   //
   // 起因：去重的目的是「避免换号换到自己」，前提是 live 真的能用。
   // 桌面端把 token 加密后 live 解析失败，但**身份字段仍是明文**，于是
-  // 「live = 账号库里那个 13800138002」这个事实依然成立——而那个账号在
+  // 「live = 账号库里那个账号」这个事实依然成立——而那个账号在
   // 账号库里存着可用的明文 token。若不回填，就等于为了一个用不了的 live
   // 白白丢掉一个能用的账号。
   const backfilledStores: typeof accountStores = []

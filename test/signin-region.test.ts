@@ -12,10 +12,10 @@ import { targetsForRegion, targetsExcept } from '../src/signin-region.ts'
 const T = [
   { id: 'live-cn', label: 'cn·当前登录', region: 'cn' as const },
   { id: 'live-global', label: 'global·当前登录', region: 'global' as const },
-  { id: 'acct:1', label: 'cn·示例昵称甲', region: 'cn' as const },
-  { id: 'acct:2', label: 'cn·13800138002', region: 'cn' as const },
-  { id: 'acct:3', label: 'cn·13800138001', region: 'cn' as const },
-  { id: 'acct:4', label: 'cn·13800138003', region: 'cn' as const },
+  { id: 'acct:1', label: 'cn·账号甲', region: 'cn' as const },
+  { id: 'acct:2', label: 'cn·账号乙', region: 'cn' as const },
+  { id: 'acct:3', label: 'cn·账号丙', region: 'cn' as const },
+  { id: 'acct:4', label: 'cn·账号丁', region: 'cn' as const },
 ]
 
 test('cn 出口只给 cn 目标，一个 global 都不许混进来', () => {

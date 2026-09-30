@@ -174,7 +174,7 @@ export interface WorkBuddyLiveIdentity {
  * **仍是明文**——身份信息拿得到，只有凭据拿不到。
  *
  * 有了它，去重就能按真实身份进行：即便 live 的 token 解不开，也知道
- * 「live 就是账号库里那个 13800138002」，于是可以自动用账号库那份顶上，
+ * 「live 就是账号库里那个账号」，于是可以自动用账号库那份顶上，
  * 而不是稀里糊涂地以为该区域没有 live 身份。
  */
 export function readLiveIdentity(text: string): WorkBuddyLiveIdentity | undefined {

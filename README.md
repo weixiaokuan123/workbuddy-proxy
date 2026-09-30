@@ -293,15 +293,19 @@ Invoke-RestMethod http://127.0.0.1:39301/status -Headers @{ Authorization = "Bea
   "preferredId": "live-cn",
   "entries": [
     { "id": "live-cn", "label": "cn·当前登录", "preferred": true, "rateLimited": false,
-      "remainingSec": 0, "active": false, "credits": 2069, "packages": 10,
+      "remainingSec": 0, "active": false, "credits": 1234, "packages": 7,
       "creditsCached": true, "creditsStale": false, "creditsAgeSec": 3 },
-    { "id": "acct:switch:…", "label": "cn·示例昵称甲", "preferred": false, "rateLimited": false,
-      "remainingSec": 0, "active": false, "credits": 1382, "packages": 20 },
-    { "id": "acct:switch:…", "label": "cn·13800138001", "preferred": false, "rateLimited": false,
-      "remainingSec": 0, "active": false, "credits": 2071, "packages": 4 }
+    { "id": "acct:switch:…", "label": "cn·账号甲", "preferred": false, "rateLimited": false,
+      "remainingSec": 0, "active": false, "credits": 567, "packages": 11 },
+    { "id": "acct:switch:…", "label": "cn·账号乙", "preferred": false, "rateLimited": false,
+      "remainingSec": 0, "active": false, "credits": 890, "packages": 3 }
   ]
 }
 ```
+
+> 上面的 `账号甲` / `账号乙` 与数字**全部是编造的**。
+> 这里的 `label` 就是上游返回的账号昵称或手机号，`credits` 是真实余额——
+> 早先这里直接贴了本机实际数据，等于把账号标识和余额一起公开了。示例必须是假数据。
 
 - 积分查询带 **60 秒缓存**（按账号身份分区），面板高频轮询不会反复打上游；
   上游抖动时回退 15 分钟内的旧值并置 `creditsStale: true`。
@@ -334,7 +338,7 @@ Invoke-RestMethod http://127.0.0.1:39301/status -Headers @{ Authorization = "Bea
 curl -H "Authorization: Bearer <该端口的 key>" http://127.0.0.1:39301/status
 # → "pool": { "size": 3, "preferredId": "live-cn",
 #             "entries": [ { "id": "live-cn", "label": "cn·当前登录", "preferred": true,
-#                            "rateLimited": false, "remainingSec": 0, "credits": 2069, "packages": 10 }, … ] }
+#                            "rateLimited": false, "remainingSec": 0, "credits": 1234, "packages": 7 }, … ] }
 # → "failover": { "enabled": true, "candidates": 3, "rateLimited": [ { "id": "acct:…", "remainingSec": 1234 } ] }
 ```
 
