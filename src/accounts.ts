@@ -122,9 +122,22 @@ export class AccountStore {
   private cache: { signature: string; accounts: StoredAccount[] } | undefined
   /** 并发 load() 共享同一次读盘，避免 /status 的 Promise.all 放大成 N 次读取。 */
   private pending: Promise<StoredAccount[]> | undefined
+  /**
+   * 变更串行队列：upsert/remove/updateTokens 都是「load → 改 → save」三步，
+   * 两个变更并发时后一个的 save 会把前一个的改动静默覆盖掉（读到的列表
+   * 不含对方未落盘的修改）。所有变更必须排队执行。
+   */
+  private writeQueue: Promise<unknown> = Promise.resolve()
 
   constructor(file: string) {
     this.file = file
+  }
+
+  /** 把一次变更排进串行队列；失败也不断链（后续变更照常执行）。 */
+  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.writeQueue.then(fn, fn)
+    this.writeQueue = run.then(() => undefined, () => undefined)
+    return run
   }
 
   /**
@@ -184,32 +197,38 @@ export class AccountStore {
 
   /** 按 key 插入或覆盖。 */
   async upsert(account: StoredAccount): Promise<{ added: boolean }> {
-    const list = await this.load()
-    const i = list.findIndex(a => a.key === account.key)
-    const added = i === -1
-    if (added) list.push(account)
-    else list[i] = { ...account, createdAtMs: list[i]?.createdAtMs ?? account.createdAtMs }
-    await this.save(list)
-    return { added }
+    return this.enqueue(async () => {
+      const list = await this.load()
+      const i = list.findIndex(a => a.key === account.key)
+      const added = i === -1
+      if (added) list.push(account)
+      else list[i] = { ...account, createdAtMs: list[i]?.createdAtMs ?? account.createdAtMs }
+      await this.save(list)
+      return { added }
+    })
   }
 
   async remove(key: string): Promise<boolean> {
-    const list = await this.load()
-    const next = list.filter(a => a.key !== key)
-    if (next.length === list.length) return false
-    await this.save(next)
-    return true
+    return this.enqueue(async () => {
+      const list = await this.load()
+      const next = list.filter(a => a.key !== key)
+      if (next.length === list.length) return false
+      await this.save(next)
+      return true
+    })
   }
 
   /** 刷新后写回 token（不回写官方 live 文件）。 */
   async updateTokens(key: string, tokens: { accessToken: string; refreshToken?: string; expiresAtMs: number }): Promise<void> {
-    const list = await this.load()
-    const a = list.find(x => x.key === key)
-    if (a === undefined) return
-    a.accessToken = tokens.accessToken
-    if (tokens.refreshToken !== undefined && tokens.refreshToken !== '') a.refreshToken = tokens.refreshToken
-    a.expiresAtMs = tokens.expiresAtMs
-    a.refreshedAtMs = Date.now()
-    await this.save(list)
+    return this.enqueue(async () => {
+      const list = await this.load()
+      const a = list.find(x => x.key === key)
+      if (a === undefined) return
+      a.accessToken = tokens.accessToken
+      if (tokens.refreshToken !== undefined && tokens.refreshToken !== '') a.refreshToken = tokens.refreshToken
+      a.expiresAtMs = tokens.expiresAtMs
+      a.refreshedAtMs = Date.now()
+      await this.save(list)
+    })
   }
 }
