@@ -34,7 +34,7 @@ import {
   type TravelStateStore,
 } from './travel.ts'
 
-import { redact, redactPaths } from './redact.ts'
+import { redact, redactPaths, registerIdentities } from './redact.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -351,6 +351,10 @@ async function main(): Promise<void> {
   // parseWorkBuddyAuth 会失败；若因此认为"该区域没有 live 身份"，
   // 就不会去重，池里会同时留着 live 和账号库两份同身份账号。
   const storedAll: StoredAccount[] = await accounts.load()
+  // 身份注册表：账号库里全部身份字段（nickname/label/uin）都注册进 redact，
+  // 日志打码才能拦住中文昵称——正则只认手机号/邮箱形态，昵称必须靠注册表。
+  // 巡检发现账号库变更时会重灌（见 travelSweepTimer）。
+  registerIdentities(storedAll.flatMap(a => [a.nickname, a.label, a.uin]))
   const liveIds = new Map<WorkBuddyRegion, Set<string>>()
   /** live 身份键（按 region）：去重与旅行目标去重都用它。 */
   const liveIdentityKeys = new Map<WorkBuddyRegion, string[]>()
@@ -365,6 +369,8 @@ async function main(): Promise<void> {
         const keys = identityKeysOfCredential(region, credential)
         liveIdentityKeys.set(region, keys)
         liveUsable.set(region, true)
+        // live 凭据里也带昵称（可能是账号库没有的新号），一并注册。
+        registerIdentities([credential.nickname, credential.uin])
       } catch {
         liveUsable.set(region, false)
         try {
@@ -914,7 +920,9 @@ async function main(): Promise<void> {
           const sig = await accounts.signature()
           if (sig === accountsSignature) return
           accountsSignature = sig
-          await accounts.load()
+          const current = await accounts.load()
+          // 账号库变了（加号/删号），身份注册表同步重灌——新昵称必须立即能被日志打码。
+          registerIdentities(current.flatMap(a => [a.nickname, a.label, a.uin]))
           await rebuildTravelTargets()
         } catch (error) {
           logger.warn('旅行：账号库巡检失败：', error instanceof Error ? error.message : String(error))
