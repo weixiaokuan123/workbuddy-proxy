@@ -1,5 +1,8 @@
 /**
- * workbuddy-proxy 鐗堟湰鍙枫€? *
- * 鏈嫭绔嬩唬鐞嗘敼鑷?dingminhua/dsh-connect-workbuddy锛圡IT锛孋opyright (c) 2026 LaoDing锛? * 鐨勭函 Node 杩炴帴鍐呮牳锛涘師鐗堢増鏈湪鏋勫缓鏈熸敞鍏ワ紝鐙珛鐗堟敼涓虹洿鎺ュ父閲忋€? */
+ * workbuddy-proxy 版本号。
+ *
+ * 独立代理，源自 dingminhua/dsh-connect-workbuddy（MIT，Copyright (c) 2026 LaoDing）。
+ * 纯 Node 连接内核；原版依赖在构建期注入，独立版改为直接常量。
+ */
 
 export const WORKBUDDY_CONNECT_VERSION = '1.3.25'
